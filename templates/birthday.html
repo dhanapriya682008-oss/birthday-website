@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#efe2ce">
+  <title>Our Secret Garden of Memories</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600;700&family=Cormorant+Garamond:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css', v=4) }}">
+</head>
+<body class="scrapbook-page">
+  <div class="garden-atmosphere" aria-hidden="true">
+    <div class="memory-lights"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="drifting-petals" id="memoryPetals"></div>
+    <div class="fireflies" id="fireflies"></div>
+  </div>
+
+  <main class="journey-root">
+    <section class="journey-scene diary-scene" data-scene="diary">
+      <div class="garden-label">a little garden made for you</div>
+      <div class="wood-table">
+        <div class="table-flowers" aria-hidden="true">✿　❀　✾　❀　✿</div>
+        <div class="diary-book" id="diaryBook">
+          <div class="diary-pages"></div>
+          <div class="diary-cover">
+            <span class="cover-sprig">❧</span>
+            <span class="cover-small">a collection of</span>
+            <span class="cover-title">Our<br>little story</span>
+            <span class="cover-date">wrapped in love, always</span>
+            <span class="cover-heart">♡</span>
+          </div>
+          <div class="diary-spine"></div>
+        </div>
+        <div class="diary-intro" id="diaryIntro" aria-live="polite">Let's walk through our beautiful memories...</div>
+        <button class="garden-button diary-open-button" id="openDiary" type="button">Open the diary <span>✦</span></button>
+        <button class="garden-button diary-next-button" id="diaryContinue" type="button" hidden>Read your letter <span>♡</span></button>
+        <div class="table-candle" aria-hidden="true"><i></i></div>
+      </div>
+      <div class="scene-fireflies" aria-hidden="true">✦　·　✧　　·　✦</div>
+    </section>
+
+    <section class="journey-scene letter-scene" data-scene="letter" hidden>
+      <header class="scene-heading">
+        <p class="hand-label">something from my heart</p>
+        <h1>A letter, just for you</h1>
+      </header>
+      <div class="letter-envelope" id="letterEnvelope">
+        <div class="envelope-back"></div>
+        <div class="envelope-letter-preview">For my favorite person <span>♡</span></div>
+        <div class="envelope-flap"></div>
+        <div class="envelope-front"></div>
+        <span class="envelope-seal">♡</span>
+      </div>
+      <button class="garden-button letter-open-button" id="openLetter" type="button">Open the letter <span>✉</span></button>
+      <article class="love-letter" id="loveLetter" hidden>
+        <div class="letter-ornament">╭─── ୨୧ ───╮</div>
+        <p class="letter-date">𝟐𝟐.𝟏𝟎 🖤🎂✨</p>
+        <div class="letter-ornament">╰─── ୨୧ ───╯</div>
+        <h2>𝑯𝒂𝒑𝒑𝒊𝒆𝒔𝒕 𝑩𝒊𝒓𝒕𝒉𝒅𝒂𝒚, 𝑴𝒚 𝑳𝒐𝒗𝒆 ❤️‍🩹🎂🫂✨</h2>
+        <div class="letter-copy">
+          <p>𝟐𝟐.𝟏𝟎… indha date enakku just oru date mattum illa. 🥹❤️ Indha naal varumbodhellam, en heart automatic-aa un kitta poidum… namma memories, namma moments, namma sirippu, namma tears, namma kadandhu vandha ellamey nyabagam varum. 🫂❤️‍🩹</p>
+          <p>Namma journey romba easy-aa irundhadhu illa. Neraya struggles, misunderstandings, difficult situations, tears ellamey namma paathutom. 💔🥺 Aana ivlo things nadandhaalum, en heart-la un mela irukkura care-um love-um mattum maarave illa. ❤️‍🩹♾️</p>
+          <p>Sometimes unnodu oru small message kooda en whole mood-a change pannidum. 🥹💗 Unnodu oru smile paathale enakku whole day happy-aa poidum. ✨❤️ Sila neram unna ninaikka reason-ey theva illa… nee already en thoughts-la oru song maadhiri silent-aa play aagittu iruppa. 🎶🌙🫂</p>
+          <p>Sila songs unna nyabagam paduthum… 🎧❤️<br>Sila places unna nyabagam paduthum… 🌙🫂<br>Sila dates unna nyabagam paduthum… 📅🥹<br>Aana sila neram, unna nyabagam padutha edhuvume theva illa…<br>because nee already en heart-la irukka. ❤️‍🩹✨</p>
+          <p>Naan feel panradhellam words-la properly solla mudiyama irukkalam… aana one thing mattum always true — nee enakku romba romba special. 🥹❤️ Namma life-la enna nadandhaalum, namma create pannina memories-ku en heart-la eppavume oru special place irukkum. 🫶🏻🌹</p>
+          <p>Indha birthday-la naan unakku oru naal happiness mattum wish panna maaten… un whole life-um happiness, peace, success, love and beautiful memories-oda irukkanum-nu wish panren. 🎂✨🤍 Un heart-la irukkura every dream-um one by one true aaganum. 🌙⭐ Unnodu andha beautiful smile eppavume fade aaga koodadhu. 🥹❤️</p>
+          <p>Enakku naan kekkura one wish mattum — life unakku eppavume smile panna reasons kudukkanum. 🫂❤️‍🩹✨</p>
+          <p>So today, 𝟐𝟐.𝟏𝟎, un birthday-nu mattum illa… en heart-ku romba special-aa irukkura oru day. 🎂❤️ Indha naaloda memories, feelings, emotions ellamey words-la full-aa explain panna mudiyadhu. Aana indha date vandha odane, en mind-la first varra person nee dhaan. 🥹🫶🏻🌙</p>
+          <p>𝑯𝒂𝒑𝒑𝒊𝒆𝒔𝒕 𝑩𝒊𝒓𝒕𝒉𝒅𝒂𝒚, 𝑴𝒚 𝑷𝒆𝒓𝒔𝒐𝒏. ❤️🎂🫂✨</p>
+          <p>𝑴𝒂𝒚 𝒚𝒐𝒖 𝒂𝒍𝒘𝒂𝒚𝒔 𝒃𝒆 𝒉𝒂𝒑𝒑𝒚, 𝒂𝒍𝒘𝒂𝒚𝒔 𝒃𝒆 𝒔𝒂𝒇𝒆, 𝒂𝒏𝒅 𝒂𝒍𝒘𝒂𝒚𝒔 𝒌𝒆𝒆𝒑 𝒔𝒎𝒊𝒍𝒊𝒏𝒈. 🤍✨</p>
+          <p>♡︎ 𝑺𝒐𝒎𝒆 𝒑𝒆𝒐𝒑𝒍𝒆 𝒂𝒓𝒆 𝒋𝒖𝒔𝒕 𝒑𝒂𝒓𝒕 𝒐𝒇 𝒂 𝒔𝒕𝒐𝒓𝒚… 𝒃𝒖𝒕 𝒔𝒐𝒎𝒆 𝒃𝒆𝒄𝒐𝒎𝒆 𝒂 𝒑𝒂𝒓𝒕 𝒐𝒇 𝒚𝒐𝒖𝒓 𝒉𝒆𝒂𝒓𝒕. ❤️‍🩹♾️🌙</p>
+          <p>🎂❤️ 𝟐𝟐.𝟏𝟎 — 𝒀𝒐𝒖𝒓 𝑫𝒂𝒚. 𝒀𝒐𝒖𝒓 𝑺𝒎𝒊𝒍𝒆. 𝒀𝒐𝒖𝒓 𝑴𝒆𝒎𝒐𝒓𝒊𝒆𝒔. 𝑨𝒏𝒅 𝒂 𝒅𝒂𝒕𝒆 𝑰'𝒍𝒍 𝒂𝒍𝒘𝒂𝒚𝒔 𝒓𝒆𝒎𝒆𝒎𝒃𝒆𝒓. 🥹❤️‍🩹🫂✨</p>
+        </div>
+        <p class="letter-signoff">With all my love, always <span>♡</span></p>
+        <button class="garden-button letter-journey-button" id="beginJourney" type="button">Walk through our years <span>→</span></button>
+      </article>
+    </section>
+
+    <section class="journey-scene memory-scene" id="journey" data-scene="memories" hidden>
+      <header class="memory-topbar">
+        <span class="memory-brand">♡ &nbsp; our years together</span>
+        <button class="music-toggle" id="musicButton" type="button" aria-pressed="false"><span class="music-symbol">♫</span><span id="musicLabel">A little music</span></button>
+      </header>
+      <div class="memory-intro"><p class="hand-label">one page at a time</p><h1>Little moments,<br><em>our whole story.</em></h1></div>
+      <div class="chapter-progress" id="chapterProgress" aria-label="Scrapbook year"></div>
+      <div class="scrapbook-spread" id="memorySpread">
+        <div class="camera-flash" id="cameraFlash" aria-hidden="true"></div>
+        <div class="spread-binding" aria-hidden="true"></div>
+        <span class="spread-flower flower-a" aria-hidden="true">✿</span>
+        <span class="spread-flower flower-b" aria-hidden="true">❀</span>
+        <span class="spread-heart" aria-hidden="true">♡</span>
+        <div class="chapter-copy">
+          <p class="chapter-kicker" id="chapterKicker"></p>
+          <h2 id="chapterYear"></h2>
+          <p class="chapter-message" id="chapterMessage"></p>
+          <p class="chapter-handnote" id="chapterHandnote"></p>
+        </div>
+        <div class="photo-board" id="photoBoard"></div>
+        <div class="spread-bottom"><span>kept close, always</span><span id="pageNumber"></span></div>
+      </div>
+      <nav class="chapter-controls" aria-label="Scrapbook pages">
+        <button class="page-arrow" id="previousYear" type="button" aria-label="Previous year">←</button>
+        <span class="page-prompt" id="pagePrompt">Turn the page</span>
+        <button class="garden-button chapter-next" id="nextYear" type="button">Next year <span>→</span></button>
+      </nav>
+    </section>
+
+    <section class="journey-scene celebration-scene" data-scene="celebration" hidden>
+      <div class="fireworks" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <div class="heart-balloons" aria-hidden="true"><span>♡</span><span>♡</span><span>♡</span><span>♡</span><span>♡</span></div>
+      <div class="celebration-copy">
+        <p class="hand-label">and the story keeps blooming</p>
+        <h1>One more wish,<br><em>just for you.</em></h1>
+      </div>
+      <div class="birthday-cake" id="birthdayCake" aria-label="A birthday cake with candles">
+        <div class="cake-candles"><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i></div>
+        <div class="cake-top"></div><div class="cake-tier tier-top"></div><div class="cake-tier tier-bottom"></div>
+        <div class="cake-plate"></div>
+      </div>
+      <div class="fairy-lights celebration-lights" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="final-message">
+        <p>Every photo tells a story.<br>Every memory holds a smile.<br>Thank you for being part of so many beautiful moments.</p>
+        <h2>Happy Birthday <span>❤️</span></h2>
+        <button class="music-toggle final-music-toggle" id="finalMusicButton" type="button" aria-pressed="false"><span class="music-symbol">♫</span><span id="finalMusicLabel">Stay a little longer</span></button>
+      </div>
+      <a class="restart-link" href="/">Wander through the garden again</a>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='js/script.js', v=5) }}"></script>
+</body>
+</html>

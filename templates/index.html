@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#25233f">
+  <title>A little secret garden</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600;700&family=Cormorant+Garamond:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css', v=4) }}">
+</head>
+<body class="garden-gateway">
+  <div class="night-garden" aria-hidden="true">
+    <div class="moon"></div>
+    <div class="garden-hill hill-back"></div>
+    <div class="garden-hill hill-front"></div>
+    <div class="fairy-lights"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="garden-flowers flowers-left"><i>✿</i><i>✾</i><i>❀</i><i>✿</i></div>
+    <div class="garden-flowers flowers-right"><i>❀</i><i>✿</i><i>✾</i><i>❀</i></div>
+    <div class="garden-flutter" id="gardenFlutter"></div>
+  </div>
+  <main class="gateway-content">
+    <p class="gateway-whisper">A little surprise is waiting for you...</p>
+    <button class="heart-flower" id="flowerButton" type="button" aria-label="Speak Hello to open your surprise">
+      <span class="flower-petal petal-1"></span><span class="flower-petal petal-2"></span>
+      <span class="flower-petal petal-3"></span><span class="flower-petal petal-4"></span>
+      <span class="flower-petal petal-5"></span><span class="flower-petal petal-6"></span>
+      <span class="flower-petal petal-7"></span><span class="flower-petal petal-8"></span>
+      <span class="flower-heart"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.2s-7.7-4.6-7.7-10.1a4.2 4.2 0 0 1 7.7-2.3 4.2 4.2 0 0 1 7.7 2.3c0 5.5-7.7 10.1-7.7 10.1Z"/><path class="heart-mic" d="M12 13.2a1.8 1.8 0 0 0 1.8-1.8V8.8a1.8 1.8 0 0 0-3.6 0v2.6a1.8 1.8 0 0 0 1.8 1.8Zm3-1.8a3 3 0 0 1-6 0m3 4v2m-1.5 0h3"/></svg></span>
+      <span class="voice-wave wave-one"></span><span class="voice-wave wave-two"></span><span class="voice-wave wave-three"></span>
+    </button>
+  </main>
+  <div class="bloom-transition" id="bloomTransition" aria-hidden="true"></div>
+  <script src="{{ url_for('static', filename='js/script.js', v=5) }}"></script>
+</body>
+</html>
