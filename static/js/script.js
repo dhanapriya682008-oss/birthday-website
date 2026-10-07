@@ -24,67 +24,100 @@ function normalizeSpokenWord(transcript) {
 }
 
 function chooseRecorderType() {
-  if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
-  if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) return "audio/ogg;codecs=opus";
-  return "audio/webm";
+  return ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4", "audio/webm"]
+    .find((type) => MediaRecorder.isTypeSupported(type)) || "";
 }
 
-async function saveVoiceRecording(blob, mimeType) {
+async function saveVoiceRecording(blob, mimeType, transcript) {
   if (!blob.size) {
     console.error("Voice recording was empty; nothing was uploaded.");
-    return false;
+    return null;
   }
-  const extension = mimeType.includes("ogg") ? "ogg" : "webm";
+  const extension = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "mp4" : "webm";
   const body = new FormData();
   body.append("audio", blob, `garden-hello.${extension}`);
+  body.append("transcript", transcript || "");
   try {
     const response = await fetch("/api/recordings", { method: "POST", body });
-    if (!response.ok) throw new Error(`Upload returned HTTP ${response.status}`);
-    return true;
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Upload returned HTTP ${response.status}`);
+    return result;
   } catch (error) {
     console.error("Voice recording upload failed:", error);
-    return false;
+    return null;
   }
 }
 
 async function beginGardenUnlock() {
   if (!flowerButton || flowerButton.disabled) return;
-  if (!("SpeechRecognition" in window || "webkitSpeechRecognition" in window) || !window.MediaRecorder) return;
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition || !window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) {
+    console.error("Voice unlock is unavailable. Use HTTPS and a browser with microphone and speech-recognition support (for example, Chrome on Android).");
+    return;
+  }
 
   flowerButton.disabled = true;
   flowerButton.classList.add("is-listening");
   let stream;
   let recorder;
+  let recognition;
+  let recordingType = "";
+  let recordingBlob = null;
+  let transcript = "";
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = chooseRecorderType();
-    recorder = new MediaRecorder(stream, { mimeType });
+    recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    recordingType = recorder.mimeType || mimeType || "audio/webm";
     const chunks = [];
     recorder.addEventListener("dataavailable", (event) => {
-      if (event.data.size) chunks.push(event.data);
+      if (event.data?.size) {
+        chunks.push(event.data);
+        console.debug(`Captured voice audio chunk (${event.data.size} bytes).`);
+      }
     });
 
-    const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+    recognition = new Recognition();
     recognition.lang = "en-US";
     recognition.interimResults = false;
     recognition.continuous = false;
-    const recognizedHello = new Promise((resolve) => {
+    recognition.maxAlternatives = 5;
+    const recognitionResult = new Promise((resolve) => {
       let settled = false;
-      const finish = (matches) => {
+      let lastTranscript = "";
+      let timeoutId;
+      const finish = (result) => {
         if (settled) return;
         settled = true;
-        resolve(matches);
+        window.clearTimeout(timeoutId);
+        resolve(result);
       };
+      timeoutId = window.setTimeout(() => {
+        console.warn("Speech recognition timed out.");
+        finish("");
+        try { recognition.stop(); } catch (_error) { /* Recognition may already have ended. */ }
+      }, 15000);
       recognition.addEventListener("result", (event) => {
-        finish(normalizeSpokenWord(event.results[0][0].transcript) === "hello");
+        const alternatives = Array.from(event.results)
+          .filter((result) => result.isFinal)
+          .flatMap((result) => Array.from(result, (alternative) => normalizeSpokenWord(alternative.transcript)));
+        console.info("Speech recognition alternatives:", alternatives);
+        lastTranscript = alternatives.find(Boolean) || lastTranscript;
+        if (alternatives.includes("hello")) {
+          finish("hello");
+          try { recognition.stop(); } catch (_error) { /* Recognition may already have ended. */ }
+        }
+      });
+      recognition.addEventListener("error", (event) => {
+        console.error("Speech recognition failed:", event.error || event);
+        finish("");
       }, { once: true });
-      recognition.addEventListener("error", () => finish(false), { once: true });
-      recognition.addEventListener("end", () => finish(false), { once: true });
+      recognition.addEventListener("end", () => finish(lastTranscript), { once: true });
     });
 
-    recorder.start();
+    recorder.start(1000);
     recognition.start();
-    const unlocked = await recognizedHello;
+    transcript = await recognitionResult;
     const stopped = new Promise((resolve) => {
       if (recorder.state === "inactive") resolve();
       else recorder.addEventListener("stop", resolve, { once: true });
@@ -92,16 +125,25 @@ async function beginGardenUnlock() {
     if (recorder.state !== "inactive") recorder.stop();
     await stopped;
     stream.getTracks().forEach((track) => track.stop());
-    await saveVoiceRecording(new Blob(chunks, { type: mimeType }), mimeType);
-
-    if (unlocked) {
-      document.body.classList.add("garden-blooming");
-      window.setTimeout(() => window.location.assign("/birthday"), 1650);
-      return;
-    }
+    recordingBlob = new Blob(chunks, { type: recordingType });
+    console.info(`Voice recording finished (${chunks.length} chunks, ${recordingBlob.size} bytes).`);
+    if (!recordingBlob.size) console.error("No audio data was captured from the microphone.");
   } catch (_error) {
+    console.error("Voice unlock failed:", _error);
+    if (recognition) {
+      try { recognition.abort(); } catch (_abortError) { /* Recognition may already have stopped. */ }
+    }
     if (recorder && recorder.state !== "inactive") recorder.stop();
     if (stream) stream.getTracks().forEach((track) => track.stop());
+  }
+
+  const serverResult = recordingBlob?.size
+    ? await saveVoiceRecording(recordingBlob, recordingType, transcript)
+    : null;
+  if (serverResult?.unlocked) {
+    document.body.classList.add("garden-blooming");
+    window.setTimeout(() => window.location.assign("/birthday"), 1650);
+    return;
   }
 
   flowerButton.disabled = false;
@@ -291,7 +333,10 @@ function updateMusicButtons(isPlaying) {
 }
 
 async function toggleMusic() {
-  if (!audioContext) audioContext = new AudioContext();
+        recognition.addEventListener("error", (event) => {
+          console.error("Speech recognition failed:", event.error || event);
+          finish(false);
+        }, { once: true });
   if (audioContext.state === "suspended") await audioContext.resume();
   if (musicTimer) {
     window.clearInterval(musicTimer);

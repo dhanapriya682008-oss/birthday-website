@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import re
+import unicodedata
 from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
@@ -21,6 +23,11 @@ def allowed_extension(filename):
 	return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def normalized_transcript(value):
+	value = unicodedata.normalize("NFKC", value or "").casefold()
+	return re.sub(r"[^\w]+", " ", value, flags=re.UNICODE).strip()
+
+
 @app.get("/")
 def index():
 	return render_template("index.html")
@@ -39,6 +46,7 @@ def photos():
 @app.post("/api/recordings")
 def upload_recording():
 	recording = request.files.get("audio")
+	transcript = normalized_transcript(request.form.get("transcript"))
 	if recording is None or not recording.filename:
 		app.logger.warning("Voice recording upload rejected: no audio file was provided.")
 		return jsonify({"error": "No audio recording was provided."}), 400
@@ -53,9 +61,23 @@ def upload_recording():
 	filename = f"voice-{timestamp}-{uuid4().hex[:10]}.{extension}"
 	destination = RECORDINGS_DIR / filename
 	recording.save(destination)
-	app.logger.info("Voice recording saved: %s (%s bytes)", destination, destination.stat().st_size)
+	size = destination.stat().st_size
+	if size == 0:
+		destination.unlink(missing_ok=True)
+		app.logger.warning("Voice recording upload rejected: %s contained no bytes.", original_name)
+		return jsonify({"error": "The audio recording is empty."}), 400
+	app.logger.info("Voice recording saved: %s (%s bytes, %s)", destination, size, recording.mimetype or "unknown MIME type")
 
-	return jsonify({"ok": True, "filename": filename, "url": f"/recordings/{filename}"}), 201
+	unlocked = transcript == "hello"
+	if unlocked:
+		app.logger.info("Voice password accepted for recording %s.", filename)
+	return jsonify({
+		"ok": True,
+		"unlocked": unlocked,
+		"filename": filename,
+		"size": size,
+		"url": f"/recordings/{filename}",
+	}), 201
 
 
 @app.get("/api/latest-recording")
