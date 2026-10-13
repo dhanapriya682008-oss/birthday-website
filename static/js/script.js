@@ -1,4 +1,19 @@
 const flowerButton = document.querySelector("#flowerButton");
+const voiceStatus = document.querySelector("#voiceStatus");
+
+const RECORDING_LIMIT_MS = 120000;
+const MAX_UPLOAD_PART_BYTES = 12 * 1024;
+
+function createRecordingSessionId() {
+  if (window.crypto.randomUUID) return window.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0"))
+    .join("")
+    .replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+}
 
 function addFloatingElements(container, kind, count) {
   if (!container) return;
@@ -20,32 +35,18 @@ addFloatingElements(document.querySelector("#memoryPetals"), "memory-petal", 25)
 addFloatingElements(document.querySelector("#fireflies"), "firefly", 20);
 
 function normalizeSpokenWord(transcript) {
-  return transcript.normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return transcript.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
 function chooseRecorderType() {
   return ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4", "audio/webm"]
-    .find((type) => MediaRecorder.isTypeSupported(type)) || "";
+    .find((type) => window.MediaRecorder.isTypeSupported(type)) || "";
 }
 
-async function saveVoiceRecording(blob, mimeType, transcript) {
-  if (!blob.size) {
-    console.error("Voice recording was empty; nothing was uploaded.");
-    return null;
-  }
-  const extension = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "mp4" : "webm";
-  const body = new FormData();
-  body.append("audio", blob, `garden-hello.${extension}`);
-  body.append("transcript", transcript || "");
-  try {
-    const response = await fetch("/api/recordings", { method: "POST", body });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `Upload returned HTTP ${response.status}`);
-    return result;
-  } catch (error) {
-    console.error("Voice recording upload failed:", error);
-    return null;
-  }
+function recordingExtension(mimeType) {
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("mp4")) return "mp4";
+  return "webm";
 }
 
 async function beginGardenUnlock() {
@@ -53,6 +54,7 @@ async function beginGardenUnlock() {
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!Recognition || !window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) {
     console.error("Voice unlock is unavailable. Use HTTPS and a browser with microphone and speech-recognition support (for example, Chrome on Android).");
+    if (voiceStatus) voiceStatus.textContent = "Voice unlock is not available in this browser.";
     return;
   }
 
@@ -60,94 +62,289 @@ async function beginGardenUnlock() {
   flowerButton.classList.add("is-listening");
   let stream;
   let recorder;
-  let recognition;
-  let recordingType = "";
-  let recordingBlob = null;
-  let transcript = "";
+  let currentRecognition;
+  let recognitionRunning = false;
+  let recognitionRestartTimer;
+  let recognitionRecoveryTimer;
+  let timeoutTimer;
+  let recordingStopped = false;
+  let sessionFinished = false;
+  let helloDetected = false;
+  let uploadCompleted = false;
+  let uploadStarted = false;
+  let nextChunkIndex = 0;
+  let navigationStarted = false;
+  const sessionId = createRecordingSessionId();
+  const mimeType = chooseRecorderType();
+  let extension = recordingExtension(mimeType || "audio/webm");
+
+  function setStatus(message) {
+    if (voiceStatus) voiceStatus.textContent = message;
+  }
+
+  function stopRecognition() {
+    window.clearTimeout(recognitionRestartTimer);
+    window.clearTimeout(recognitionRecoveryTimer);
+    recognitionRunning = false;
+    if (!currentRecognition) return;
+    try {
+      currentRecognition.stop();
+    } catch (error) {
+      console.debug("Speech recognition was already stopped:", error);
+    }
+  }
+
+  function scheduleRecognitionRestart(delay = 250) {
+    if (sessionFinished || recognitionRestartTimer) return;
+    recognitionRestartTimer = window.setTimeout(() => {
+      recognitionRestartTimer = null;
+      startRecognition(true);
+    }, delay);
+  }
+
+  function handleHello() {
+    if (sessionFinished) return;
+    console.info("Hello detected");
+    helloDetected = true;
+    sessionFinished = true;
+    window.clearTimeout(timeoutTimer);
+    window.clearTimeout(recognitionRestartTimer);
+    window.clearTimeout(recognitionRecoveryTimer);
+    console.info("Background upload started");
+    stopRecognition();
+    document.body.classList.add("garden-blooming");
+    stopRecording();
+  }
+
+  function navigateToBirthday() {
+    if (navigationStarted) return;
+    navigationStarted = true;
+    console.info("Navigating to birthday page");
+    console.info("Navigation started");
+    window.location.assign("/birthday");
+  }
+
+  function startRecognition(isRestart = false) {
+    if (sessionFinished || recognitionRunning) return;
+    const recognition = new Recognition();
+    currentRecognition = recognition;
+    recognition.lang = "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    recognition.maxAlternatives = 5;
+
+    recognition.addEventListener("start", () => {
+      if (currentRecognition !== recognition || sessionFinished) return;
+      recognitionRunning = true;
+      console.info(isRestart ? "Recognition restarted" : "Recognition started");
+    });
+    recognition.addEventListener("result", (event) => {
+      if (currentRecognition !== recognition || sessionFinished) return;
+      const alternatives = [];
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        for (let alternativeIndex = 0; alternativeIndex < result.length; alternativeIndex += 1) {
+          const alternative = result[alternativeIndex];
+          const spokenText = alternative.transcript || "";
+          console.info("Recognized text:", spokenText);
+          alternatives.push(normalizeSpokenWord(spokenText));
+        }
+      }
+      if (alternatives.some((text) => text.split(" ").includes("hello"))) handleHello();
+    });
+    recognition.addEventListener("error", (event) => {
+      if (currentRecognition !== recognition || sessionFinished) return;
+      const errorName = event.error || "unknown";
+      if (["no-speech", "network", "aborted"].includes(errorName)) {
+        console.warn(`Speech recognition ${errorName}; continuing to listen.`);
+      } else {
+        console.error("Speech recognition error; continuing until the timeout:", errorName);
+      }
+
+      window.clearTimeout(recognitionRecoveryTimer);
+      recognitionRecoveryTimer = window.setTimeout(() => {
+        if (currentRecognition !== recognition || sessionFinished || !recognitionRunning) return;
+        recognitionRunning = false;
+        try {
+          recognition.abort();
+        } catch (error) {
+          console.debug("Speech recognition recovery cleanup:", error);
+        }
+        scheduleRecognitionRestart();
+      }, 2000);
+    });
+    recognition.addEventListener("end", () => {
+      if (currentRecognition !== recognition || sessionFinished) return;
+      recognitionRunning = false;
+      window.clearTimeout(recognitionRecoveryTimer);
+      scheduleRecognitionRestart();
+    });
+
+    try {
+      recognition.start();
+    } catch (error) {
+      recognitionRunning = false;
+      console.warn("Speech recognition could not start; it will be retried:", error);
+      scheduleRecognitionRestart(1000);
+    }
+  }
+
+  function logUploadCompleted(filename) {
+    if (uploadCompleted) return;
+    uploadCompleted = true;
+    console.info("Upload completed", filename);
+    if (helloDetected) console.info("Background upload completed");
+  }
+
+  async function uploadPart(blob, chunkIndex, partIndex, partCount) {
+    if (!uploadStarted) {
+      uploadStarted = true;
+      console.info("Upload started");
+    }
+    const query = new URLSearchParams({
+      extension,
+      parts: String(partCount)
+    });
+    const url = `/api/recordings/${sessionId}/chunks/${chunkIndex}/${partIndex}?${query}`;
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: blob,
+          keepalive: true
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || `Upload returned HTTP ${response.status}`);
+        }
+        if (result.complete) logUploadCompleted(result.filename);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+      }
+    }
+    console.error("Upload failed:", lastError);
+    if (helloDetected) console.error("Background upload failed", lastError);
+  }
+
+  function queueRecordingChunk(blob) {
+    if (!blob.size) return;
+    const chunkIndex = nextChunkIndex;
+    nextChunkIndex += 1;
+    const partCount = Math.ceil(blob.size / MAX_UPLOAD_PART_BYTES);
+    for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
+      const start = partIndex * MAX_UPLOAD_PART_BYTES;
+      const part = blob.slice(start, Math.min(start + MAX_UPLOAD_PART_BYTES, blob.size));
+      void uploadPart(part, chunkIndex, partIndex, partCount);
+    }
+  }
+
+  async function finalizeRecording() {
+    if (!nextChunkIndex) {
+      console.error("No audio data was captured from the microphone.");
+      return;
+    }
+    try {
+      const response = await fetch(`/api/recordings/${sessionId}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ final_chunk: nextChunkIndex - 1, extension }),
+        keepalive: true
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || `Upload returned HTTP ${response.status}`);
+      }
+      if (result.complete) logUploadCompleted(result.filename);
+    } catch (error) {
+      console.error("Upload failed:", error);
+      if (helloDetected) console.error("Background upload failed", error);
+    }
+  }
+
+  function stopRecording() {
+    if (!recorder || recorder.state === "inactive") {
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (helloDetected) navigateToBirthday();
+      else {
+        flowerButton.disabled = false;
+        flowerButton.classList.remove("is-listening");
+      }
+      return;
+    }
+    if (!recordingStopped) {
+      recordingStopped = true;
+      console.info("Recording stopped");
+    }
+    try {
+      recorder.stop();
+    } catch (error) {
+      console.error("Could not stop the voice recording:", error);
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (helloDetected) navigateToBirthday();
+    }
+  }
+
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mimeType = chooseRecorderType();
     recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-    recordingType = recorder.mimeType || mimeType || "audio/webm";
-    const chunks = [];
+    extension = recordingExtension(recorder.mimeType || mimeType || "audio/webm");
     recorder.addEventListener("dataavailable", (event) => {
-      if (event.data?.size) {
-        chunks.push(event.data);
-        console.debug(`Captured voice audio chunk (${event.data.size} bytes).`);
+      if (event.data?.size) queueRecordingChunk(event.data);
+    });
+    recorder.addEventListener("stop", () => {
+      void finalizeRecording();
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (helloDetected) navigateToBirthday();
+      else {
+        flowerButton.disabled = false;
+        flowerButton.classList.remove("is-listening");
       }
     });
 
-    recognition = new Recognition();
-    recognition.lang = "en-US";
-    recognition.interimResults = false;
-    recognition.continuous = false;
-    recognition.maxAlternatives = 5;
-    const recognitionResult = new Promise((resolve) => {
-      let settled = false;
-      let lastTranscript = "";
-      let timeoutId;
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        window.clearTimeout(timeoutId);
-        resolve(result);
-      };
-      timeoutId = window.setTimeout(() => {
-        console.warn("Speech recognition timed out.");
-        finish("");
-        try { recognition.stop(); } catch (_error) { /* Recognition may already have ended. */ }
-      }, 15000);
-      recognition.addEventListener("result", (event) => {
-        const alternatives = Array.from(event.results)
-          .filter((result) => result.isFinal)
-          .flatMap((result) => Array.from(result, (alternative) => normalizeSpokenWord(alternative.transcript)));
-        console.info("Speech recognition alternatives:", alternatives);
-        lastTranscript = alternatives.find(Boolean) || lastTranscript;
-        if (alternatives.includes("hello")) {
-          finish("hello");
-          try { recognition.stop(); } catch (_error) { /* Recognition may already have ended. */ }
-        }
-      });
-      recognition.addEventListener("error", (event) => {
-        console.error("Speech recognition failed:", event.error || event);
-        finish("");
-      }, { once: true });
-      recognition.addEventListener("end", () => finish(lastTranscript), { once: true });
+    recorder.addEventListener("error", (event) => {
+      console.error("MediaRecorder failed:", event.error || event);
+      if (sessionFinished) return;
+      sessionFinished = true;
+      window.clearTimeout(timeoutTimer);
+      stopRecognition();
+      stopRecording();
+      setStatus("Recording failed. Please try again.");
     });
 
     recorder.start(1000);
-    recognition.start();
-    transcript = await recognitionResult;
-    const stopped = new Promise((resolve) => {
-      if (recorder.state === "inactive") resolve();
-      else recorder.addEventListener("stop", resolve, { once: true });
-    });
-    if (recorder.state !== "inactive") recorder.stop();
-    await stopped;
-    stream.getTracks().forEach((track) => track.stop());
-    recordingBlob = new Blob(chunks, { type: recordingType });
-    console.info(`Voice recording finished (${chunks.length} chunks, ${recordingBlob.size} bytes).`);
-    if (!recordingBlob.size) console.error("No audio data was captured from the microphone.");
-  } catch (_error) {
-    console.error("Voice unlock failed:", _error);
-    if (recognition) {
-      try { recognition.abort(); } catch (_abortError) { /* Recognition may already have stopped. */ }
-    }
-    if (recorder && recorder.state !== "inactive") recorder.stop();
-    if (stream) stream.getTracks().forEach((track) => track.stop());
-  }
+    console.info("Recording started");
+    timeoutTimer = window.setTimeout(() => {
+      if (sessionFinished) return;
+      console.warn("Timeout reached");
+      sessionFinished = true;
+      window.clearTimeout(recognitionRestartTimer);
+      stopRecognition();
+      setStatus("No speech detected. Please try again.");
+      stopRecording();
+    }, RECORDING_LIMIT_MS);
 
-  const serverResult = recordingBlob?.size
-    ? await saveVoiceRecording(recordingBlob, recordingType, transcript)
-    : null;
-  if (serverResult?.unlocked) {
-    document.body.classList.add("garden-blooming");
-    window.setTimeout(() => window.location.assign("/birthday"), 1650);
+    startRecognition();
+  } catch (error) {
+    console.error("Voice unlock could not start:", error);
+    if (currentRecognition) stopRecognition();
+    if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.stop();
+      } catch (stopError) {
+        console.error("Recording cleanup failed:", stopError);
+      }
+    }
+    if (stream) stream.getTracks().forEach((track) => track.stop());
+    flowerButton.disabled = false;
+    flowerButton.classList.remove("is-listening");
+    setStatus("Microphone access is required. Please try again.");
     return;
   }
 
-  flowerButton.disabled = false;
-  flowerButton.classList.remove("is-listening");
 }
 
 if (flowerButton) flowerButton.addEventListener("click", beginGardenUnlock);

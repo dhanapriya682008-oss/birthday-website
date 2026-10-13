@@ -44,6 +44,7 @@ button { cursor: pointer; }
 @keyframes float-garden { 0% { transform: translate3d(0, 0, 0) rotate(0); opacity: 0; } 12% { opacity: .72; } 85% { opacity: .6; } 100% { transform: translate3d(var(--drift), -125vh, 0) rotate(240deg); opacity: 0; } }
 .gateway-content { position: relative; z-index: 2; min-height: 100svh; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: clamp(36px, 7vh, 76px); padding: 32px 20px; text-align: center; }
 .gateway-whisper { margin: 0; font: 500 clamp(2rem, 5vw, 3.5rem)/1.1 var(--hand); color: #fff1e3; text-shadow: 0 2px 25px #e9c2d477; animation: whisper-arrive 1.4s both; }
+.voice-status { min-height: 1.4em; margin: -28px 0 0; color: #fff1e3; font: 500 1.2rem/1.2 var(--hand); text-shadow: 0 2px 15px #e9c2d477; }
 @keyframes whisper-arrive { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
 .heart-flower { position: relative; width: 180px; height: 180px; padding: 0; border: 0; background: transparent; isolation: isolate; filter: drop-shadow(0 0 27px #ee9bb077); transition: transform .4s ease, filter .4s ease; animation: flower-breathe 4s ease-in-out infinite; }
 .heart-flower:hover { transform: scale(1.06); filter: drop-shadow(0 0 42px #ffc5beaa); }
