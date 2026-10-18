@@ -1,18 +1,3 @@
-from flask_cors import CORS
-
-app = Flask(__name__)
-
-CORS(
-    app,
-    resources={
-        r"/api/*": {
-            "origins": [
-                "https://dhanapriya682008-oss.github.io"
-            ]
-        }
-    }
-)
-
 from datetime import datetime, timezone
 import json
 import os
@@ -25,6 +10,7 @@ from uuid import UUID
 from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 
@@ -40,6 +26,16 @@ MAX_UPLOAD_PART_SIZE = 12 * 1024
 MAX_RECORDING_CHUNKS = 240
 
 app = Flask(__name__)
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": [
+                "https://dhanapriya682008-oss.github.io"
+            ]
+        }
+    }
+)
 app.config["MAX_CONTENT_LENGTH"] = MAX_RECORDING_SIZE
 
 

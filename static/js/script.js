@@ -106,7 +106,7 @@ async function beginGardenUnlock() {
 
   function handleHello() {
     if (sessionFinished) return;
-    console.info("Hello detected");
+    console.info("Hello detected; opening the birthday page.");
     helloDetected = true;
     sessionFinished = true;
     window.clearTimeout(timeoutTimer);
@@ -116,6 +116,7 @@ async function beginGardenUnlock() {
     stopRecognition();
     document.body.classList.add("garden-blooming");
     stopRecording();
+    navigateToBirthday();
   }
 
   function navigateToBirthday() {
@@ -123,7 +124,7 @@ async function beginGardenUnlock() {
     navigationStarted = true;
     console.info("Navigating to birthday page");
     console.info("Navigation started");
-    window.location.assign("/birthday.html");
+    window.location.assign("birthday.html");
   }
 
   function startRecognition(isRestart = false) {
@@ -157,6 +158,15 @@ async function beginGardenUnlock() {
     recognition.addEventListener("error", (event) => {
       if (currentRecognition !== recognition || sessionFinished) return;
       const errorName = event.error || "unknown";
+      if (["not-allowed", "service-not-allowed"].includes(errorName)) {
+        console.error("Speech recognition permission was denied. Allow microphone access for this site in Chrome.", errorName);
+        sessionFinished = true;
+        window.clearTimeout(timeoutTimer);
+        stopRecognition();
+        stopRecording();
+        setStatus("Microphone permission is required. Allow access in Chrome and try again.");
+        return;
+      }
       if (["no-speech", "network", "aborted"].includes(errorName)) {
         console.warn(`Speech recognition ${errorName}; continuing to listen.`);
       } else {
@@ -406,7 +416,7 @@ async function beginGardenUnlock() {
 
     startRecognition();
   } catch (error) {
-    console.error("Voice unlock could not start:", error);
+    console.error("Voice unlock could not start. Check microphone permission and browser support:", error.name || error);
     if (currentRecognition) stopRecognition();
     if (recorder && recorder.state !== "inactive") {
       try {
@@ -418,7 +428,9 @@ async function beginGardenUnlock() {
     if (stream) stream.getTracks().forEach((track) => track.stop());
     flowerButton.disabled = false;
     flowerButton.classList.remove("is-listening");
-    setStatus("Microphone access is required. Please try again.");
+    setStatus(error.name === "NotAllowedError" || error.name === "SecurityError"
+      ? "Microphone permission was denied. Allow access in Chrome and try again."
+      : "Microphone access is required. Please try again.");
     return;
   }
 
