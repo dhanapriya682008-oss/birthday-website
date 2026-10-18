@@ -306,6 +306,8 @@ def complete_chunked_recording(session_id):
 		return jsonify(complete), 200
 
 	metadata = request.get_json(silent=True)
+	if not isinstance(metadata, dict) and request.mimetype == "application/x-www-form-urlencoded":
+		metadata = request.form.to_dict()
 	if not isinstance(metadata, dict):
 		return jsonify({"success": False, "error": "Invalid recording completion metadata."}), 400
 	try:

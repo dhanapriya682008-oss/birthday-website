@@ -3,6 +3,12 @@ const voiceStatus = document.querySelector("#voiceStatus");
 const API_BASE_URL = "https://birthday-website-1-dhd2.onrender.com";
 const RECORDING_LIMIT_MS = 120000;
 const MAX_UPLOAD_PART_BYTES = 12 * 1024;
+let voiceSessionGeneration = 0;
+
+function logVoice(level, message, details) {
+  const logger = console[level] || console.info;
+  logger.call(console, `[voice ${new Date().toISOString()}] ${message}`, details || "");
+}
 
 function createRecordingSessionId() {
   if (window.crypto.randomUUID) return window.crypto.randomUUID();
@@ -39,6 +45,7 @@ function normalizeSpokenWord(transcript) {
 }
 
 function chooseRecorderType() {
+  if (typeof window.MediaRecorder.isTypeSupported !== "function") return "";
   return ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4", "audio/webm"]
     .find((type) => window.MediaRecorder.isTypeSupported(type)) || "";
 }
@@ -51,9 +58,11 @@ function recordingExtension(mimeType) {
 
 async function beginGardenUnlock() {
   if (!flowerButton || flowerButton.disabled) return;
+  const sessionGeneration = ++voiceSessionGeneration;
+  logVoice("info", "Flower button clicked; creating voice session.", { sessionGeneration });
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!Recognition || !window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) {
-    console.error("Voice unlock is unavailable. Use HTTPS and a browser with microphone and speech-recognition support (for example, Chrome on Android).");
+    logVoice("error", "Voice unlock is unavailable. Use HTTPS and a browser with microphone and speech-recognition support.");
     if (voiceStatus) voiceStatus.textContent = "Voice unlock is not available in this browser.";
     return;
   }
@@ -79,6 +88,11 @@ async function beginGardenUnlock() {
   const sessionId = createRecordingSessionId();
   const mimeType = chooseRecorderType();
   let extension = recordingExtension(mimeType || "audio/webm");
+  logVoice("info", "Voice session created.", { sessionGeneration, sessionId });
+
+  function isCurrentSession() {
+    return sessionGeneration === voiceSessionGeneration;
+  }
 
   function setStatus(message) {
     if (voiceStatus) voiceStatus.textContent = message;
@@ -92,74 +106,140 @@ async function beginGardenUnlock() {
     try {
       currentRecognition.stop();
     } catch (error) {
-      console.debug("Speech recognition was already stopped:", error);
+      logVoice("warn", "Speech recognition was already stopped.", error);
     }
   }
 
   function scheduleRecognitionRestart(delay = 250) {
-    if (sessionFinished || recognitionRestartTimer) return;
+    if (!isCurrentSession() || sessionFinished || recognitionRestartTimer) return;
     recognitionRestartTimer = window.setTimeout(() => {
       recognitionRestartTimer = null;
-      startRecognition(true);
+      if (isCurrentSession()) startRecognition(true);
     }, delay);
   }
 
   function handleHello() {
-    if (sessionFinished) return;
-    console.info("Hello detected; opening the birthday page.");
+    if (!isCurrentSession() || sessionFinished) return;
+    logVoice("info", "Hello detected.");
     helloDetected = true;
     sessionFinished = true;
     window.clearTimeout(timeoutTimer);
     window.clearTimeout(recognitionRestartTimer);
     window.clearTimeout(recognitionRecoveryTimer);
-    console.info("Background upload started");
     stopRecognition();
     document.body.classList.add("garden-blooming");
     stopRecording();
-    navigateToBirthday();
   }
 
   function navigateToBirthday() {
-    if (navigationStarted) return;
+    if (!isCurrentSession() || navigationStarted) return;
     navigationStarted = true;
-    console.info("Navigating to birthday page");
-    console.info("Navigation started");
+    logVoice("info", "Navigation initiated.", { destination: "birthday.html", sessionId });
     window.location.assign("birthday.html");
   }
 
+  function beaconUploadPart(job) {
+    const query = new URLSearchParams({ extension, parts: String(job.partCount) });
+    const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${job.chunkIndex}/${job.partIndex}?${query}`;
+    const body = new Blob([job.blob], { type: "text/plain;charset=UTF-8" });
+    logVoice("info", "Audio chunk sendBeacon request.", {
+      sessionId, chunkIndex: job.chunkIndex, partIndex: job.partIndex, bytes: job.blob.size, url
+    });
+    const accepted = navigator.sendBeacon(url, body);
+    logVoice(accepted ? "info" : "error", "Unload-safe chunk upload queued.", {
+      sessionId,
+      chunkIndex: job.chunkIndex,
+      partIndex: job.partIndex,
+      bytes: job.blob.size,
+      accepted
+    });
+    if (!accepted) {
+      void fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body,
+        keepalive: true
+      }).then((response) => {
+        logVoice(response.ok ? "info" : "error", "Keepalive chunk upload response.", {
+          sessionId, chunkIndex: job.chunkIndex, partIndex: job.partIndex, status: response.status
+        });
+      }).catch((error) => logVoice("error", "Keepalive chunk upload failed.", error));
+    }
+  }
+
+  function flushUploadsBeforeNavigation() {
+    const uniqueJobs = new Map();
+    uploadQueue.forEach((job) => uniqueJobs.set(`${job.chunkIndex}:${job.partIndex}`, job));
+    uniqueJobs.forEach(beaconUploadPart);
+    uploadQueue.length = 0;
+
+    if (nextChunkIndex > 0) {
+      const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
+      const body = new URLSearchParams({
+        final_chunk: String(nextChunkIndex - 1),
+        extension
+      });
+      const accepted = navigator.sendBeacon(url, body);
+      logVoice(accepted ? "info" : "error", "Unload-safe recording finalization queued.", {
+        sessionId, finalChunk: nextChunkIndex - 1, accepted
+      });
+      if (!accepted) {
+        void fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ final_chunk: nextChunkIndex - 1, extension }),
+          keepalive: true
+        }).then((response) => {
+          logVoice(response.ok ? "info" : "error", "Keepalive finalization response.", {
+            sessionId, status: response.status
+          });
+        }).catch((error) => logVoice("error", "Keepalive finalization failed.", error));
+      }
+    } else {
+      logVoice("error", "No audio chunks were captured; cannot finalize recording.", { sessionId });
+    }
+  }
+
   function startRecognition(isRestart = false) {
-    if (sessionFinished || recognitionRunning) return;
+    if (!isCurrentSession() || sessionFinished || recognitionRunning) return;
     const recognition = new Recognition();
     currentRecognition = recognition;
+    recognitionRunning = true;
     recognition.lang = "en-US";
     recognition.interimResults = true;
     recognition.continuous = true;
     recognition.maxAlternatives = 5;
 
     recognition.addEventListener("start", () => {
-      if (currentRecognition !== recognition || sessionFinished) return;
+      if (!isCurrentSession() || currentRecognition !== recognition || sessionFinished) return;
       recognitionRunning = true;
-      console.info(isRestart ? "Recognition restarted" : "Recognition started");
+      logVoice("info", isRestart ? "Speech recognition restarted." : "Speech recognition started.", { sessionId });
+    });
+    ["audiostart", "audioend", "soundstart", "soundend", "speechstart", "speechend", "nomatch"].forEach((eventName) => {
+      recognition.addEventListener(eventName, (event) => {
+        if (!isCurrentSession() || currentRecognition !== recognition) return;
+        logVoice("info", `Speech recognition ${eventName} event.`, { sessionId, event });
+      });
     });
     recognition.addEventListener("result", (event) => {
-      if (currentRecognition !== recognition || sessionFinished) return;
+      if (!isCurrentSession() || currentRecognition !== recognition || sessionFinished) return;
       const alternatives = [];
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index];
         for (let alternativeIndex = 0; alternativeIndex < result.length; alternativeIndex += 1) {
           const alternative = result[alternativeIndex];
           const spokenText = alternative.transcript || "";
-          console.info("Recognized text:", spokenText);
+          logVoice("info", "Speech transcript.", { sessionId, transcript: spokenText });
           alternatives.push(normalizeSpokenWord(spokenText));
         }
       }
       if (alternatives.some((text) => text.split(" ").includes("hello"))) handleHello();
     });
     recognition.addEventListener("error", (event) => {
-      if (currentRecognition !== recognition || sessionFinished) return;
+      if (!isCurrentSession() || currentRecognition !== recognition || sessionFinished) return;
       const errorName = event.error || "unknown";
       if (["not-allowed", "service-not-allowed"].includes(errorName)) {
-        console.error("Speech recognition permission was denied. Allow microphone access for this site in Chrome.", errorName);
+        logVoice("error", "Speech recognition permission was denied. Allow microphone access for this site in Chrome.", errorName);
         sessionFinished = true;
         window.clearTimeout(timeoutTimer);
         stopRecognition();
@@ -168,26 +248,27 @@ async function beginGardenUnlock() {
         return;
       }
       if (["no-speech", "network", "aborted"].includes(errorName)) {
-        console.warn(`Speech recognition ${errorName}; continuing to listen.`);
+        logVoice("warn", `Speech recognition ${errorName}; continuing to listen.`, { sessionId });
       } else {
-        console.error("Speech recognition error; continuing until the timeout:", errorName);
+        logVoice("error", "Speech recognition error; continuing until the timeout.", { sessionId, error: errorName });
       }
 
       window.clearTimeout(recognitionRecoveryTimer);
       recognitionRecoveryTimer = window.setTimeout(() => {
-        if (currentRecognition !== recognition || sessionFinished || !recognitionRunning) return;
+        if (!isCurrentSession() || currentRecognition !== recognition || sessionFinished || !recognitionRunning) return;
         recognitionRunning = false;
         try {
           recognition.abort();
         } catch (error) {
-          console.debug("Speech recognition recovery cleanup:", error);
+          logVoice("warn", "Speech recognition recovery cleanup failed.", error);
         }
         scheduleRecognitionRestart();
       }, 2000);
     });
     recognition.addEventListener("end", () => {
-      if (currentRecognition !== recognition || sessionFinished) return;
+      if (!isCurrentSession() || currentRecognition !== recognition || sessionFinished) return;
       recognitionRunning = false;
+      logVoice("info", "Speech recognition ended.", { sessionId });
       window.clearTimeout(recognitionRecoveryTimer);
       scheduleRecognitionRestart();
     });
@@ -196,7 +277,7 @@ async function beginGardenUnlock() {
       recognition.start();
     } catch (error) {
       recognitionRunning = false;
-      console.warn("Speech recognition could not start; it will be retried:", error);
+      logVoice("error", "Speech recognition could not start; it will be retried.", error);
       scheduleRecognitionRestart(1000);
     }
   }
@@ -204,8 +285,7 @@ async function beginGardenUnlock() {
   function logUploadCompleted(filename) {
     if (uploadCompleted) return;
     uploadCompleted = true;
-    console.info("Upload completed", filename);
-    if (helloDetected) console.info("Background upload completed");
+    logVoice("info", "Backend confirmed recording upload.", { sessionId, filename });
   }
 
   function enqueueUpload(job) {
@@ -216,7 +296,7 @@ async function beginGardenUnlock() {
   async function uploadPart(blob, chunkIndex, partIndex, partCount) {
     if (!uploadStarted) {
       uploadStarted = true;
-      console.info("Upload started", { sessionId });
+      logVoice("info", "Audio upload started.", { sessionId });
     }
     const query = new URLSearchParams({
       extension,
@@ -228,9 +308,10 @@ async function beginGardenUnlock() {
       const controller = new AbortController();
       const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
       try {
+        logVoice("info", "Audio chunk upload request.", { sessionId, chunkIndex, partIndex, bytes: blob.size, attempt: attempt + 1 });
         const response = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/octet-stream" },
+          headers: { "Content-Type": "text/plain;charset=UTF-8" },
           body: blob,
           keepalive: true,
           signal: controller.signal
@@ -241,7 +322,7 @@ async function beginGardenUnlock() {
           error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
           throw error;
         }
-        console.info("Audio chunk accepted", {
+        logVoice("info", "Audio chunk upload response.", {
           sessionId,
           chunkIndex,
           partIndex,
@@ -252,7 +333,7 @@ async function beginGardenUnlock() {
         return;
       } catch (error) {
         lastError = error;
-        console.warn("Audio chunk upload attempt failed", {
+        logVoice("warn", "Audio chunk upload attempt failed.", {
           sessionId,
           chunkIndex,
           partIndex,
@@ -267,13 +348,13 @@ async function beginGardenUnlock() {
         window.clearTimeout(requestTimeout);
       }
     }
-    console.error("Audio chunk upload failed after retries", {
+    logVoice("error", "Audio chunk upload failed after retries.", {
       sessionId,
       chunkIndex,
       partIndex,
       error: lastError
     });
-    if (helloDetected) console.error("Background upload failed", lastError);
+    if (helloDetected) logVoice("error", "Background upload failed.", lastError);
   }
 
   async function processUploadQueue() {
@@ -292,6 +373,7 @@ async function beginGardenUnlock() {
 
   function queueRecordingChunk(blob) {
     if (!blob.size) return;
+    logVoice("info", "Audio data captured.", { sessionId, bytes: blob.size, mimeType: blob.type });
     const chunkIndex = nextChunkIndex;
     nextChunkIndex += 1;
     const partCount = Math.ceil(blob.size / MAX_UPLOAD_PART_BYTES);
@@ -304,7 +386,7 @@ async function beginGardenUnlock() {
 
   async function finalizeRecording() {
     if (!nextChunkIndex) {
-      console.error("No audio data was captured from the microphone.", { sessionId });
+      logVoice("error", "No audio data was captured from the microphone.", { sessionId });
       return;
     }
     const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
@@ -313,6 +395,7 @@ async function beginGardenUnlock() {
       const controller = new AbortController();
       const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
       try {
+        logVoice("info", "Recording finalization request.", { sessionId, finalChunk: nextChunkIndex - 1, attempt: attempt + 1 });
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -326,7 +409,7 @@ async function beginGardenUnlock() {
           error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
           throw error;
         }
-        console.info("Recording finalization accepted", {
+        logVoice(response.ok ? "info" : "error", "Recording finalization response.", {
           sessionId,
           finalChunk: nextChunkIndex - 1,
           status: response.status,
@@ -335,7 +418,7 @@ async function beginGardenUnlock() {
         if (result.complete) logUploadCompleted(result.filename);
         return;
       } catch (error) {
-        console.warn("Recording finalization attempt failed", {
+        logVoice("warn", "Recording finalization attempt failed.", {
           sessionId,
           attempt: attempt + 1,
           error
@@ -348,53 +431,91 @@ async function beginGardenUnlock() {
         window.clearTimeout(requestTimeout);
       }
     }
-    console.error("Recording finalization failed after retries", { sessionId });
-    if (helloDetected) console.error("Background upload failed", { sessionId });
+    logVoice("error", "Recording finalization failed after retries.", { sessionId });
   }
 
   function stopRecording() {
     if (!recorder || recorder.state === "inactive") {
       if (stream) stream.getTracks().forEach((track) => track.stop());
-      if (helloDetected) navigateToBirthday();
+      if (helloDetected) {
+        flushUploadsBeforeNavigation();
+        logVoice("info", "Voice session cleanup completed.", { sessionId });
+        navigateToBirthday();
+      }
       else {
-        flowerButton.disabled = false;
-        flowerButton.classList.remove("is-listening");
+        if (isCurrentSession()) {
+          flowerButton.disabled = false;
+          flowerButton.classList.remove("is-listening");
+        }
+        logVoice("info", "Voice session cleanup completed.", { sessionId });
       }
       return;
     }
     if (!recordingStopped) {
       recordingStopped = true;
-      console.info("Recording stopped");
+      logVoice("info", "Stopping MediaRecorder.", { sessionId, state: recorder.state });
     }
     try {
       recorder.stop();
     } catch (error) {
-      console.error("Could not stop the voice recording:", error);
+      logVoice("error", "Could not stop the voice recording.", error);
       if (stream) stream.getTracks().forEach((track) => track.stop());
-      if (helloDetected) navigateToBirthday();
+      if (helloDetected) {
+        flushUploadsBeforeNavigation();
+        logVoice("info", "Voice session cleanup completed after recorder stop failure.", { sessionId });
+        navigateToBirthday();
+      }
     }
   }
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!isCurrentSession()) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    logVoice("info", "Microphone permission granted.", { sessionId });
     recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
     extension = recordingExtension(recorder.mimeType || mimeType || "audio/webm");
+    logVoice("info", "MediaRecorder created.", { sessionId, mimeType: recorder.mimeType || "browser default" });
+    recorder.addEventListener("start", () => {
+      logVoice("info", "MediaRecorder started.", { sessionId, state: recorder.state });
+    });
+    ["pause", "resume"].forEach((eventName) => {
+      recorder.addEventListener(eventName, () => {
+        logVoice("info", `MediaRecorder ${eventName} event.`, { sessionId, state: recorder.state });
+      });
+    });
     recorder.addEventListener("dataavailable", (event) => {
+      if (!isCurrentSession()) return;
       if (event.data?.size) queueRecordingChunk(event.data);
+      else logVoice("warn", "MediaRecorder emitted an empty audio chunk.", { sessionId });
     });
     recorder.addEventListener("stop", () => {
-      void finalizeRecording();
+      logVoice("info", "MediaRecorder stopped; final dataavailable event has been handled.", { sessionId });
       if (stream) stream.getTracks().forEach((track) => track.stop());
-      if (helloDetected) navigateToBirthday();
+      if (!isCurrentSession()) {
+        logVoice("info", "Ignored stale voice-session stop callback.", { sessionId });
+        return;
+      }
+      if (helloDetected) {
+        flushUploadsBeforeNavigation();
+        logVoice("info", "Voice session cleanup completed.", { sessionId });
+        navigateToBirthday();
+      }
       else {
-        flowerButton.disabled = false;
-        flowerButton.classList.remove("is-listening");
+        void finalizeRecording();
+        if (isCurrentSession()) {
+          flowerButton.disabled = false;
+          flowerButton.classList.remove("is-listening");
+        }
+        logVoice("info", "Voice session cleanup completed.", { sessionId });
       }
     });
 
     recorder.addEventListener("error", (event) => {
-      console.error("MediaRecorder failed:", event.error || event);
-      if (sessionFinished) return;
+      logVoice("error", "MediaRecorder failed.", event.error || event);
+      if (!isCurrentSession() || sessionFinished) return;
       sessionFinished = true;
       window.clearTimeout(timeoutTimer);
       stopRecognition();
@@ -403,10 +524,13 @@ async function beginGardenUnlock() {
     });
 
     recorder.start(1000);
-    console.info("Recording started");
+    if (recorder.state !== "recording") {
+      throw new Error(`MediaRecorder did not enter recording state (state: ${recorder.state}).`);
+    }
+    logVoice("info", "MediaRecorder is recording.", { sessionId });
     timeoutTimer = window.setTimeout(() => {
-      if (sessionFinished) return;
-      console.warn("Timeout reached");
+      if (!isCurrentSession() || sessionFinished) return;
+      logVoice("warn", "Voice recognition timeout reached.", { sessionId });
       sessionFinished = true;
       window.clearTimeout(recognitionRestartTimer);
       stopRecognition();
@@ -416,18 +540,20 @@ async function beginGardenUnlock() {
 
     startRecognition();
   } catch (error) {
-    console.error("Voice unlock could not start. Check microphone permission and browser support:", error.name || error);
+    logVoice("error", "Voice unlock could not start. Check microphone permission and browser support.", error);
     if (currentRecognition) stopRecognition();
     if (recorder && recorder.state !== "inactive") {
       try {
         recorder.stop();
       } catch (stopError) {
-        console.error("Recording cleanup failed:", stopError);
+        logVoice("error", "Recording cleanup failed.", stopError);
       }
     }
     if (stream) stream.getTracks().forEach((track) => track.stop());
-    flowerButton.disabled = false;
-    flowerButton.classList.remove("is-listening");
+    if (isCurrentSession()) {
+      flowerButton.disabled = false;
+      flowerButton.classList.remove("is-listening");
+    }
     setStatus(error.name === "NotAllowedError" || error.name === "SecurityError"
       ? "Microphone permission was denied. Allow access in Chrome and try again."
       : "Microphone access is required. Please try again.");
@@ -619,10 +745,6 @@ function updateMusicButtons(isPlaying) {
 }
 
 async function toggleMusic() {
-        recognition.addEventListener("error", (event) => {
-          console.error("Speech recognition failed:", event.error || event);
-          finish(false);
-        }, { once: true });
   if (audioContext.state === "suspended") await audioContext.resume();
   if (musicTimer) {
     window.clearInterval(musicTimer);
