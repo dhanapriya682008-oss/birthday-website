@@ -1,6 +1,6 @@
 const flowerButton = document.querySelector("#flowerButton");
 const voiceStatus = document.querySelector("#voiceStatus");
-
+const API_BASE_URL = "https://birthday-website-1-dhd2.onrender.com";
 const RECORDING_LIMIT_MS = 120000;
 const MAX_UPLOAD_PART_BYTES = 12 * 1024;
 
@@ -73,6 +73,8 @@ async function beginGardenUnlock() {
   let uploadCompleted = false;
   let uploadStarted = false;
   let nextChunkIndex = 0;
+  const uploadQueue = [];
+  let uploadQueueRunning = false;
   let navigationStarted = false;
   const sessionId = createRecordingSessionId();
   const mimeType = chooseRecorderType();
@@ -121,7 +123,7 @@ async function beginGardenUnlock() {
     navigationStarted = true;
     console.info("Navigating to birthday page");
     console.info("Navigation started");
-    window.location.assign("/birthday");
+    window.location.assign("/birthday.html");
   }
 
   function startRecognition(isRestart = false) {
@@ -196,38 +198,86 @@ async function beginGardenUnlock() {
     if (helloDetected) console.info("Background upload completed");
   }
 
+  function enqueueUpload(job) {
+    uploadQueue.push(job);
+    void processUploadQueue();
+  }
+
   async function uploadPart(blob, chunkIndex, partIndex, partCount) {
     if (!uploadStarted) {
       uploadStarted = true;
-      console.info("Upload started");
+      console.info("Upload started", { sessionId });
     }
     const query = new URLSearchParams({
       extension,
       parts: String(partCount)
     });
-    const url = `/api/recordings/${sessionId}/chunks/${chunkIndex}/${partIndex}?${query}`;
+    const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${chunkIndex}/${partIndex}?${query}`;
     let lastError;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const controller = new AbortController();
+      const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
       try {
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/octet-stream" },
           body: blob,
-          keepalive: true
+          keepalive: true,
+          signal: controller.signal
         });
         const result = await response.json();
         if (!response.ok || !result.success) {
-          throw new Error(result.error || `Upload returned HTTP ${response.status}`);
+          const error = new Error(result.error || `HTTP ${response.status}`);
+          error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+          throw error;
         }
+        console.info("Audio chunk accepted", {
+          sessionId,
+          chunkIndex,
+          partIndex,
+          status: response.status,
+          complete: result.complete === true
+        });
         if (result.complete) logUploadCompleted(result.filename);
         return;
       } catch (error) {
         lastError = error;
-        if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+        console.warn("Audio chunk upload attempt failed", {
+          sessionId,
+          chunkIndex,
+          partIndex,
+          attempt: attempt + 1,
+          error
+        });
+        if (error.retryable === false) break;
+        if (attempt < 4) {
+          await new Promise((resolve) => window.setTimeout(resolve, Math.min(250 * (2 ** attempt), 4000)));
+        }
+      } finally {
+        window.clearTimeout(requestTimeout);
       }
     }
-    console.error("Upload failed:", lastError);
+    console.error("Audio chunk upload failed after retries", {
+      sessionId,
+      chunkIndex,
+      partIndex,
+      error: lastError
+    });
     if (helloDetected) console.error("Background upload failed", lastError);
+  }
+
+  async function processUploadQueue() {
+    if (uploadQueueRunning) return;
+    uploadQueueRunning = true;
+    try {
+      while (uploadQueue.length) {
+        const job = uploadQueue.shift();
+        await uploadPart(job.blob, job.chunkIndex, job.partIndex, job.partCount);
+      }
+    } finally {
+      uploadQueueRunning = false;
+      if (uploadQueue.length) void processUploadQueue();
+    }
   }
 
   function queueRecordingChunk(blob) {
@@ -238,31 +288,58 @@ async function beginGardenUnlock() {
     for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
       const start = partIndex * MAX_UPLOAD_PART_BYTES;
       const part = blob.slice(start, Math.min(start + MAX_UPLOAD_PART_BYTES, blob.size));
-      void uploadPart(part, chunkIndex, partIndex, partCount);
+      enqueueUpload({ blob: part, chunkIndex, partIndex, partCount });
     }
   }
 
   async function finalizeRecording() {
     if (!nextChunkIndex) {
-      console.error("No audio data was captured from the microphone.");
+      console.error("No audio data was captured from the microphone.", { sessionId });
       return;
     }
-    try {
-      const response = await fetch(`/api/recordings/${sessionId}/complete`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ final_chunk: nextChunkIndex - 1, extension }),
-        keepalive: true
-      });
-      const result = await response.json();
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || `Upload returned HTTP ${response.status}`);
+    const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
+    const body = JSON.stringify({ final_chunk: nextChunkIndex - 1, extension });
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const controller = new AbortController();
+      const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          keepalive: true,
+          signal: controller.signal
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          const error = new Error(result.error || `HTTP ${response.status}`);
+          error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+          throw error;
+        }
+        console.info("Recording finalization accepted", {
+          sessionId,
+          finalChunk: nextChunkIndex - 1,
+          status: response.status,
+          complete: result.complete === true
+        });
+        if (result.complete) logUploadCompleted(result.filename);
+        return;
+      } catch (error) {
+        console.warn("Recording finalization attempt failed", {
+          sessionId,
+          attempt: attempt + 1,
+          error
+        });
+        if (error.retryable === false) break;
+        if (attempt < 4) {
+          await new Promise((resolve) => window.setTimeout(resolve, Math.min(250 * (2 ** attempt), 4000)));
+        }
+      } finally {
+        window.clearTimeout(requestTimeout);
       }
-      if (result.complete) logUploadCompleted(result.filename);
-    } catch (error) {
-      console.error("Upload failed:", error);
-      if (helloDetected) console.error("Background upload failed", error);
     }
+    console.error("Recording finalization failed after retries", { sessionId });
+    if (helloDetected) console.error("Background upload failed", { sessionId });
   }
 
   function stopRecording() {

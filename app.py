@@ -1,3 +1,18 @@
+from flask_cors import CORS
+
+app = Flask(__name__)
+
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": [
+                "https://dhanapriya682008-oss.github.io"
+            ]
+        }
+    }
+)
+
 from datetime import datetime, timezone
 import json
 import os
@@ -60,6 +75,23 @@ def finalized_upload(session_id):
 	if not marker_path.is_file():
 		return None
 	return json.loads(marker_path.read_text(encoding="utf-8"))
+
+
+def missing_recording_parts(session_id, final_chunk):
+	session_dir, _, _, _ = upload_paths(session_id)
+	chunks_dir = session_dir / "chunks"
+	missing = []
+	for chunk_index in range(final_chunk + 1):
+		descriptor_path = chunks_dir / f"chunk_{chunk_index:06d}.json"
+		if not descriptor_path.is_file():
+			missing.append(f"chunk {chunk_index}: descriptor")
+			continue
+		descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+		for part_index in range(descriptor["parts"]):
+			part_path = chunks_dir / f"chunk_{chunk_index:06d}" / f"part_{part_index:04d}.bin"
+			if not part_path.is_file():
+				missing.append(f"chunk {chunk_index}: part {part_index}")
+	return missing
 
 
 def assemble_chunked_recording(session_id, retry_after_lock=True):
@@ -222,6 +254,19 @@ def upload_recording_chunk(session_id, chunk_index, part_index):
 	chunks_dir = session_dir / "chunks"
 	chunk_dir = chunks_dir / f"chunk_{chunk_index:06d}"
 	chunk_dir.mkdir(parents=True, exist_ok=True)
+	descriptor_path = chunks_dir / f"chunk_{chunk_index:06d}.json"
+	if descriptor_path.is_file():
+		existing = json.loads(descriptor_path.read_text(encoding="utf-8"))
+		if existing.get("parts") != part_count or existing.get("extension") != extension:
+			app.logger.error(
+				"Conflicting chunk metadata: session=%s chunk=%d existing=%s received_parts=%d extension=%s",
+				session_id,
+				chunk_index,
+				existing,
+				part_count,
+				extension,
+			)
+			return jsonify({"success": False, "error": "Conflicting audio chunk metadata."}), 409
 	part_path = chunk_dir / f"part_{part_index:04d}.bin"
 	temporary_part = part_path.with_name(f"{part_path.name}.{uuid4().hex}.tmp")
 	try:
@@ -230,11 +275,18 @@ def upload_recording_chunk(session_id, chunk_index, part_index):
 	finally:
 		temporary_part.unlink(missing_ok=True)
 
-	descriptor_path = chunks_dir / f"chunk_{chunk_index:06d}.json"
 	write_json_atomically(descriptor_path, {
 		"parts": part_count,
 		"extension": extension,
 	})
+	app.logger.info(
+		"Audio chunk stored: session=%s chunk=%d part=%d/%d bytes=%d",
+		session_id,
+		chunk_index,
+		part_index,
+		part_count,
+		len(payload),
+	)
 
 	try:
 		result = assemble_chunked_recording(session_id)
@@ -268,8 +320,19 @@ def complete_chunked_recording(session_id):
 	if final_chunk < 0 or final_chunk >= MAX_RECORDING_CHUNKS or extension not in ALLOWED_EXTENSIONS:
 		return jsonify({"success": False, "error": "Invalid recording completion metadata."}), 400
 
-	session_dir, _, finalization_path, _ = upload_paths(session_id)
-	if not finalization_path.is_file():
+	_, _, finalization_path, _ = upload_paths(session_id)
+	finalization = {"final_chunk": final_chunk, "extension": extension}
+	if finalization_path.is_file():
+		existing = json.loads(finalization_path.read_text(encoding="utf-8"))
+		if existing != finalization:
+			app.logger.error(
+				"Conflicting recording finalization: session=%s existing=%s received=%s",
+				session_id,
+				existing,
+				finalization,
+			)
+			return jsonify({"success": False, "error": "Conflicting recording finalization."}), 409
+	else:
 		write_json_atomically(finalization_path, {
 			"final_chunk": final_chunk,
 			"extension": extension,
@@ -281,7 +344,18 @@ def complete_chunked_recording(session_id):
 		return jsonify({"success": False, "error": str(error)}), 400
 	if result:
 		return jsonify(result), 201
-	app.logger.info("Voice recording completion queued for session %s.", session_id)
+	try:
+		missing = missing_recording_parts(session_id, final_chunk)
+	except (OSError, ValueError, KeyError, TypeError) as error:
+		app.logger.exception("Could not inspect pending recording session %s.", session_id)
+		return jsonify({"success": False, "error": "Could not inspect the uploaded recording."}), 500
+	app.logger.warning(
+		"Recording assembly pending: session=%s final_chunk=%d missing_parts=%d first_missing=%s",
+		session_id,
+		final_chunk,
+		len(missing),
+		missing[:10],
+	)
 	return jsonify({"success": True, "complete": False, "filename": None}), 202
 
 
