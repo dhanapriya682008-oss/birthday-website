@@ -197,81 +197,83 @@ async function requestRecordingUpload(url, options, description) {
 function processRecordingUpload(sessionId) {
   if (activeRecordingUploads.has(sessionId)) return activeRecordingUploads.get(sessionId);
   const upload = (async () => {
-    const pending = await readPendingRecordingUploads();
-    const session = pending.sessions.find((item) => item.sessionId === sessionId);
-    if (!session) return;
-    const parts = pending.parts
-      .filter((item) => item.sessionId === sessionId)
-      .sort((left, right) => left.chunkIndex - right.chunkIndex || left.partIndex - right.partIndex);
+    while (true) {
+      try {
+        const pending = await readPendingRecordingUploads();
+        const session = pending.sessions.find((item) => item.sessionId === sessionId);
+        if (!session) return false;
+        const parts = pending.parts
+          .filter((item) => item.sessionId === sessionId)
+          .sort((left, right) => left.chunkIndex - right.chunkIndex || left.partIndex - right.partIndex);
 
-    for (const part of parts) {
-      const query = new URLSearchParams({
-        extension: part.extension,
-        parts: String(part.partCount)
-      });
-      const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${part.chunkIndex}/${part.partIndex}?${query}`;
-      const { result } = await requestRecordingUpload(url, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=UTF-8" },
-        body: part.blob
-      }, "Audio chunk upload");
-      await removeUploadedRecordingPart(part.key);
-      if (result.complete === true && result.filename && Number(result.size) > 0) {
+        for (const part of parts) {
+          const query = new URLSearchParams({
+            extension: part.extension,
+            parts: String(part.partCount)
+          });
+          const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${part.chunkIndex}/${part.partIndex}?${query}`;
+          const { result } = await requestRecordingUpload(url, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=UTF-8" },
+            body: part.blob
+          }, "Audio chunk upload");
+          await removeUploadedRecordingPart(part.key);
+          if (result.complete === true && result.filename && Number(result.size) > 0) {
+            logVoice("info", "Backend confirmed a non-empty recording file.", {
+              sessionId, filename: result.filename, bytes: result.size
+            });
+            await removeFinishedRecording(sessionId);
+            return true;
+          }
+        }
+
+        const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
+        const body = JSON.stringify({ final_chunk: session.finalChunk, extension: session.extension });
+        let result;
+        let completionConfirmed = false;
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const completion = await requestRecordingUpload(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body
+          }, "Recording completion");
+          result = completion.result;
+          if (
+            result.complete === true
+            && result.filename
+            && Number.isInteger(Number(result.size))
+            && Number(result.size) > 0
+          ) {
+            completionConfirmed = true;
+            break;
+          }
+          if (completion.response.status !== 202) {
+            const error = new Error(`Backend did not confirm a non-empty recording file (HTTP ${completion.response.status}).`);
+            error.retryable = false;
+            throw error;
+          }
+          logVoice("warn", "Backend accepted completion but still reports missing audio parts.", {
+            sessionId, attempt: attempt + 1, body: result
+          });
+          if (attempt < 4) {
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          }
+        }
+        if (!completionConfirmed) {
+          const error = new Error("Backend did not confirm the completed recording after five checks.");
+          error.retryable = true;
+          throw error;
+        }
         logVoice("info", "Backend confirmed a non-empty recording file.", {
           sessionId, filename: result.filename, bytes: result.size
         });
         await removeFinishedRecording(sessionId);
-        return;
+        return true;
+      } catch (error) {
+        logVoice("error", "Recording upload remains queued for a later retry.", { sessionId, error });
+        if (error.retryable === false) return false;
+        await new Promise((resolve) => window.setTimeout(resolve, 5000));
       }
-    }
-
-    const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
-    const body = JSON.stringify({ final_chunk: session.finalChunk, extension: session.extension });
-    let result;
-    let completionConfirmed = false;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const completion = await requestRecordingUpload(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body
-      }, "Recording completion");
-      result = completion.result;
-      if (
-        result.complete === true
-        && result.filename
-        && Number.isInteger(Number(result.size))
-        && Number(result.size) > 0
-      ) {
-        completionConfirmed = true;
-        break;
-      }
-      if (completion.response.status !== 202) {
-        const error = new Error(`Backend did not confirm a non-empty recording file (HTTP ${completion.response.status}).`);
-        error.retryable = false;
-        throw error;
-      }
-      logVoice("warn", "Backend accepted completion but still reports missing audio parts.", {
-        sessionId, attempt: attempt + 1, body: result
-      });
-      if (attempt < 4) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1000));
-      }
-    }
-    if (!completionConfirmed) {
-      const error = new Error("Backend did not confirm the completed recording after five checks.");
-      error.retryable = true;
-      throw error;
-    }
-    logVoice("info", "Backend confirmed a non-empty recording file.", {
-      sessionId, filename: result.filename, bytes: result.size
-    });
-    await removeFinishedRecording(sessionId);
-  })().catch((error) => {
-    logVoice("error", "Recording upload remains queued for a later retry.", { sessionId, error });
-    if (error.retryable !== false) {
-      window.setTimeout(() => {
-        void processRecordingUpload(sessionId);
-      }, 5000);
     }
   }).finally(() => {
     activeRecordingUploads.delete(sessionId);
@@ -294,6 +296,7 @@ async function resumePendingRecordingUploads() {
 
 async function beginGardenUnlock() {
   if (!flowerButton || flowerButton.disabled) return;
+  void resumePendingRecordingUploads();
   const sessionGeneration = ++voiceSessionGeneration;
   logVoice("info", "Flower button clicked; creating voice session.", { sessionGeneration });
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -376,14 +379,15 @@ async function beginGardenUnlock() {
     stopRecognition();
     setStatus("Hello heard — opening your surprise. The recording will upload in the background.");
     document.body.classList.add("garden-blooming");
-    stopRecording();
+    if (recorder) stopRecording();
   }
 
   function navigateToBirthday() {
     if (!isCurrentSession() || navigationStarted) return;
     navigationStarted = true;
-    logVoice("info", "Navigation initiated.", { destination: "birthday.html", sessionId });
-    window.location.assign("birthday.html");
+    const destination = new URL("/birthday", API_BASE_URL).href;
+    logVoice("info", "Navigation initiated.", { destination, sessionId });
+    window.location.assign(destination);
   }
 
   function startRecognition(isRestart = false) {
@@ -503,7 +507,7 @@ async function beginGardenUnlock() {
   async function finalizeRecording() {
     if (!nextChunkIndex) {
       logVoice("error", "No audio data was captured from the microphone.", { sessionId });
-      return false;
+      return null;
     }
     await Promise.all(pendingChunkWrites);
     await persistRecordingFinalization(sessionId, nextChunkIndex - 1, extension);
@@ -515,8 +519,7 @@ async function beginGardenUnlock() {
       totalAudioBytes: capturedAudioBytes,
       finalChunk: nextChunkIndex - 1
     });
-    void processRecordingUpload(sessionId);
-    return true;
+    return { uploadPromise: processRecordingUpload(sessionId) };
   }
 
   function stopRecording() {
@@ -541,8 +544,10 @@ async function beginGardenUnlock() {
   async function finishRecording() {
     if (recordingFinalizationStarted) return;
     recordingFinalizationStarted = true;
+    let uploadPromise;
     try {
-      await finalizeRecording();
+      const finalized = await finalizeRecording();
+      uploadPromise = finalized?.uploadPromise;
     } catch (error) {
       logVoice("error", "Could not save the recording to local browser storage.", { sessionId, error });
       setStatus("The recording could not be queued for upload. Check browser storage permissions.");
@@ -555,8 +560,37 @@ async function beginGardenUnlock() {
       totalAudioBytes: capturedAudioBytes
     });
     if (helloDetected) {
-      logVoice("info", "Opening the surprise without waiting for the recording upload.", { sessionId });
-      navigateToBirthday();
+      if (!uploadPromise) {
+        setStatus("No audio recording was captured, so the surprise was not opened. Try again.");
+        flowerButton.disabled = false;
+        flowerButton.classList.remove("is-listening");
+        return;
+      }
+      let deadlineTimer;
+      const uploadDeadline = new Promise((resolve) => {
+        deadlineTimer = window.setTimeout(() => resolve("timeout"), 15000);
+      });
+      const uploadConfirmed = await Promise.race([uploadPromise, uploadDeadline]);
+      window.clearTimeout(deadlineTimer);
+      if (uploadConfirmed === true) {
+        logVoice("info", "Backend confirmed the recording; opening the birthday page.", { sessionId });
+        navigateToBirthday();
+      } else if (uploadConfirmed === "timeout") {
+        logVoice("error", "Recording upload is still pending; staying on the gateway until the server confirms the file.", {
+          sessionId
+        });
+        setStatus("Recording is still uploading. This page will open the surprise only after the server confirms the saved file.");
+        flowerButton.disabled = false;
+        flowerButton.classList.remove("is-listening");
+        void uploadPromise.then((confirmed) => {
+          if (confirmed && isCurrentSession() && helloDetected) navigateToBirthday();
+        });
+      } else {
+        logVoice("error", "The backend did not confirm the recording; navigation was cancelled.", { sessionId });
+        setStatus("The recording was not confirmed by the server. Check the Console and try again.");
+        flowerButton.disabled = false;
+        flowerButton.classList.remove("is-listening");
+      }
     } else if (isCurrentSession()) {
       flowerButton.disabled = false;
       flowerButton.classList.remove("is-listening");
@@ -571,9 +605,8 @@ async function beginGardenUnlock() {
     setStatus("Listening for “hello”…");
     startRecognition();
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (!isCurrentSession() || sessionFinished) {
+    if (!isCurrentSession() || (sessionFinished && !helloDetected)) {
       stream.getTracks().forEach((track) => track.stop());
-      if (helloDetected) navigateToBirthday();
       return;
     }
     logVoice("info", "Microphone permission granted.", { sessionId });
@@ -620,16 +653,20 @@ async function beginGardenUnlock() {
     }
     recordingStartedAt = performance.now();
     logVoice("info", "MediaRecorder is recording.", { sessionId });
-    setStatus("Microphone ready — say “hello” to continue.");
-    timeoutTimer = window.setTimeout(() => {
-      if (!isCurrentSession() || sessionFinished) return;
-      logVoice("warn", "Voice recognition timeout reached.", { sessionId });
-      sessionFinished = true;
-      window.clearTimeout(recognitionRestartTimer);
-      stopRecognition();
-      setStatus("No speech detected. Please try again.");
-      stopRecording();
-    }, RECORDING_LIMIT_MS);
+    if (helloDetected) {
+      window.setTimeout(stopRecording, 500);
+    } else {
+      setStatus("Microphone ready — say “hello” to continue.");
+      timeoutTimer = window.setTimeout(() => {
+        if (!isCurrentSession() || sessionFinished) return;
+        logVoice("warn", "Voice recognition timeout reached.", { sessionId });
+        sessionFinished = true;
+        window.clearTimeout(recognitionRestartTimer);
+        stopRecognition();
+        setStatus("No speech detected. Please try again.");
+        stopRecording();
+      }, RECORDING_LIMIT_MS);
+    }
 
   } catch (error) {
     logVoice("error", "Voice unlock could not start. Check HTTPS, microphone permission, and browser support.", error);

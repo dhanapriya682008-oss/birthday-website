@@ -134,7 +134,7 @@ def assemble_chunked_recording(session_id, retry_after_lock=True):
 			deadline = time.monotonic() + 2
 			while time.monotonic() < deadline:
 				if marker_path.is_file():
-					return json.loads(marker_path.read_text(encoding="utf-8"))
+					return validate_completed_recording(json.loads(marker_path.read_text(encoding="utf-8")))
 				if not lock_path.exists():
 					return assemble_chunked_recording(session_id, retry_after_lock=False)
 				time.sleep(0.01)
@@ -143,7 +143,7 @@ def assemble_chunked_recording(session_id, retry_after_lock=True):
 	try:
 		os.close(lock_fd)
 		if marker_path.is_file():
-			return json.loads(marker_path.read_text(encoding="utf-8"))
+			return validate_completed_recording(json.loads(marker_path.read_text(encoding="utf-8")))
 
 		if not finalization_path.is_file():
 			return None
