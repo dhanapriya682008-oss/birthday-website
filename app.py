@@ -15,7 +15,7 @@ from werkzeug.utils import secure_filename
 
 
 BASE_DIR = Path(__file__).resolve().parent
-RECORDINGS_DIR = BASE_DIR / "recordings"
+RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", str(BASE_DIR / "recordings"))).expanduser().resolve()
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = RECORDINGS_DIR / ".uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,6 +37,7 @@ CORS(
     }
 )
 app.config["MAX_CONTENT_LENGTH"] = MAX_RECORDING_SIZE
+app.logger.info("Voice recording storage directory: %s", RECORDINGS_DIR)
 
 
 def allowed_extension(filename):
@@ -70,7 +71,38 @@ def finalized_upload(session_id):
 	_, marker_path, _, _ = upload_paths(session_id)
 	if not marker_path.is_file():
 		return None
-	return json.loads(marker_path.read_text(encoding="utf-8"))
+	return validate_completed_recording(json.loads(marker_path.read_text(encoding="utf-8")))
+
+
+def validate_completed_recording(result):
+	if not isinstance(result, dict):
+		raise ValueError("The completed recording marker is invalid.")
+	filename = result.get("filename")
+	size = result.get("size")
+	if (
+		result.get("success") is not True
+		or result.get("complete") is not True
+		or not isinstance(filename, str)
+		or secure_filename(filename) != filename
+		or not isinstance(size, int)
+		or size <= 0
+	):
+		raise ValueError("The completed recording marker is invalid.")
+	destination = RECORDINGS_DIR / filename
+	try:
+		actual_size = destination.stat().st_size
+	except OSError:
+		app.logger.exception("Completed recording file is missing: %s", destination)
+		raise
+	if actual_size <= 0 or actual_size != size:
+		app.logger.error(
+			"Completed recording file size mismatch: path=%s marker_size=%d actual_size=%d",
+			destination,
+			size,
+			actual_size,
+		)
+		raise OSError(f"Completed recording file is missing or incomplete: {destination}.")
+	return result
 
 
 def missing_recording_parts(session_id, final_chunk):
@@ -93,7 +125,7 @@ def missing_recording_parts(session_id, final_chunk):
 def assemble_chunked_recording(session_id, retry_after_lock=True):
 	session_dir, marker_path, finalization_path, lock_path = upload_paths(session_id)
 	if marker_path.is_file():
-		return json.loads(marker_path.read_text(encoding="utf-8"))
+		return validate_completed_recording(json.loads(marker_path.read_text(encoding="utf-8")))
 
 	try:
 		lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -148,13 +180,21 @@ def assemble_chunked_recording(session_id, retry_after_lock=True):
 					with part_path.open("rb") as part:
 						shutil.copyfileobj(part, output)
 			os.replace(temporary, destination)
+			if not destination.is_file():
+				raise OSError(f"Assembled recording was not created at {destination}.")
+			saved_size = destination.stat().st_size
+			if saved_size <= 0 or saved_size != total_size:
+				destination.unlink(missing_ok=True)
+				raise OSError(
+					f"Assembled recording size mismatch at {destination}: expected {total_size}, got {saved_size}."
+				)
 		finally:
 			temporary.unlink(missing_ok=True)
 
-		result = {"success": True, "complete": True, "filename": filename, "size": total_size}
+		result = {"success": True, "complete": True, "filename": filename, "size": saved_size}
 		write_json_atomically(marker_path, result)
 		shutil.rmtree(session_dir, ignore_errors=True)
-		app.logger.info("Voice recording saved: %s (%s bytes)", filename, total_size)
+		app.logger.info("Voice recording saved: path=%s size=%d bytes", destination, saved_size)
 		return result
 	finally:
 		lock_path.unlink(missing_ok=True)
@@ -192,13 +232,22 @@ def upload_recording():
 	timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 	filename = f"recording_{timestamp}_{uuid4().hex}.{extension}"
 	destination = RECORDINGS_DIR / filename
-	recording.save(destination)
-	size = destination.stat().st_size
+	try:
+		recording.save(destination)
+		size = destination.stat().st_size
+	except OSError:
+		app.logger.exception("Could not write voice recording to %s.", destination)
+		return jsonify({"success": False, "error": "The recording could not be saved on the server."}), 500
 	if size == 0:
 		destination.unlink(missing_ok=True)
 		app.logger.warning("Voice recording upload rejected: %s contained no bytes.", original_name)
 		return jsonify({"error": "The audio recording is empty."}), 400
-	app.logger.info("Voice recording saved: %s (%s bytes, %s)", filename, size, recording.mimetype or "unknown MIME type")
+	app.logger.info(
+		"Voice recording saved: path=%s size=%d bytes mime=%s",
+		destination,
+		size,
+		recording.mimetype or "unknown MIME type",
+	)
 
 	unlocked = transcript == "hello"
 	if unlocked:
@@ -220,7 +269,11 @@ def upload_recording_chunk(session_id, chunk_index, part_index):
 	except ValueError:
 		return jsonify({"success": False, "error": "Invalid recording session."}), 400
 
-	complete = finalized_upload(session_id)
+	try:
+		complete = finalized_upload(session_id)
+	except (OSError, ValueError, KeyError, TypeError):
+		app.logger.exception("Could not verify completed recording for session %s.", session_id)
+		return jsonify({"success": False, "error": "The saved recording could not be verified."}), 500
 	if complete:
 		return jsonify(complete), 200
 
@@ -268,13 +321,31 @@ def upload_recording_chunk(session_id, chunk_index, part_index):
 	try:
 		temporary_part.write_bytes(payload)
 		os.replace(temporary_part, part_path)
+	except OSError:
+		app.logger.exception(
+			"Could not save audio part: session=%s chunk=%d part=%d path=%s",
+			session_id,
+			chunk_index,
+			part_index,
+			part_path,
+		)
+		return jsonify({"success": False, "error": "The audio chunk could not be saved on the server."}), 500
 	finally:
 		temporary_part.unlink(missing_ok=True)
 
-	write_json_atomically(descriptor_path, {
-		"parts": part_count,
-		"extension": extension,
-	})
+	try:
+		write_json_atomically(descriptor_path, {
+			"parts": part_count,
+			"extension": extension,
+		})
+	except OSError:
+		app.logger.exception(
+			"Could not save audio chunk metadata: session=%s chunk=%d path=%s",
+			session_id,
+			chunk_index,
+			descriptor_path,
+		)
+		return jsonify({"success": False, "error": "The audio chunk metadata could not be saved."}), 500
 	app.logger.info(
 		"Audio chunk stored: session=%s chunk=%d part=%d/%d bytes=%d",
 		session_id,
@@ -286,9 +357,12 @@ def upload_recording_chunk(session_id, chunk_index, part_index):
 
 	try:
 		result = assemble_chunked_recording(session_id)
-	except (OSError, ValueError) as error:
+	except ValueError as error:
 		app.logger.exception("Voice recording assembly failed for session %s.", session_id)
 		return jsonify({"success": False, "error": str(error)}), 400
+	except OSError:
+		app.logger.exception("Could not write assembled voice recording for session %s.", session_id)
+		return jsonify({"success": False, "error": "The recording could not be saved on the server."}), 500
 	if result:
 		return jsonify(result), 201
 	return jsonify({"success": True, "complete": False}), 202
@@ -301,7 +375,11 @@ def complete_chunked_recording(session_id):
 	except ValueError:
 		return jsonify({"success": False, "error": "Invalid recording session."}), 400
 
-	complete = finalized_upload(session_id)
+	try:
+		complete = finalized_upload(session_id)
+	except (OSError, ValueError, KeyError, TypeError):
+		app.logger.exception("Could not verify completed recording for session %s.", session_id)
+		return jsonify({"success": False, "error": "The saved recording could not be verified."}), 500
 	if complete:
 		return jsonify(complete), 200
 
@@ -331,15 +409,26 @@ def complete_chunked_recording(session_id):
 			)
 			return jsonify({"success": False, "error": "Conflicting recording finalization."}), 409
 	else:
-		write_json_atomically(finalization_path, {
-			"final_chunk": final_chunk,
-			"extension": extension,
-		})
+		try:
+			write_json_atomically(finalization_path, {
+				"final_chunk": final_chunk,
+				"extension": extension,
+			})
+		except OSError:
+			app.logger.exception(
+				"Could not save recording finalization metadata: session=%s path=%s",
+				session_id,
+				finalization_path,
+			)
+			return jsonify({"success": False, "error": "Recording completion metadata could not be saved."}), 500
 	try:
 		result = assemble_chunked_recording(session_id)
-	except (OSError, ValueError) as error:
+	except ValueError as error:
 		app.logger.exception("Voice recording assembly failed for session %s.", session_id)
 		return jsonify({"success": False, "error": str(error)}), 400
+	except OSError:
+		app.logger.exception("Could not write assembled voice recording for session %s.", session_id)
+		return jsonify({"success": False, "error": "The recording could not be saved on the server."}), 500
 	if result:
 		return jsonify(result), 201
 	try:

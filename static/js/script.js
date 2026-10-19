@@ -4,6 +4,8 @@ const API_BASE_URL = "https://birthday-website-1-dhd2.onrender.com";
 const RECORDING_LIMIT_MS = 120000;
 const MAX_UPLOAD_PART_BYTES = 12 * 1024;
 let voiceSessionGeneration = 0;
+let recordingDatabasePromise;
+const activeRecordingUploads = new Map();
 
 function logVoice(level, message, details) {
   const logger = console[level] || console.info;
@@ -45,7 +47,7 @@ function normalizeSpokenWord(transcript) {
 }
 
 function chooseRecorderType() {
-  if (typeof window.MediaRecorder.isTypeSupported !== "function") return "";
+  if (!window.MediaRecorder || typeof window.MediaRecorder.isTypeSupported !== "function") return "";
   return ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4", "audio/webm"]
     .find((type) => window.MediaRecorder.isTypeSupported(type)) || "";
 }
@@ -56,14 +58,258 @@ function recordingExtension(mimeType) {
   return "webm";
 }
 
+function openRecordingDatabase() {
+  if (recordingDatabasePromise) return recordingDatabasePromise;
+  recordingDatabasePromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open("garden-recordings", 1);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains("parts")) {
+        database.createObjectStore("parts", { keyPath: "key" });
+      }
+      if (!database.objectStoreNames.contains("sessions")) {
+        database.createObjectStore("sessions", { keyPath: "sessionId" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open local recording storage."));
+    request.onblocked = () => reject(new Error("Local recording storage is blocked by another open page."));
+  });
+  return recordingDatabasePromise;
+}
+
+function transactionFinished(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error || new Error("Local recording storage failed."));
+    transaction.onabort = () => reject(transaction.error || new Error("Local recording storage transaction was aborted."));
+  });
+}
+
+async function persistRecordingParts(sessionId, chunkIndex, partCount, extension, parts) {
+  const database = await openRecordingDatabase();
+  const transaction = database.transaction("parts", "readwrite");
+  const finished = transactionFinished(transaction);
+  const store = transaction.objectStore("parts");
+  parts.forEach((blob, partIndex) => {
+    store.put({
+      key: `${sessionId}:${chunkIndex}:${partIndex}`,
+      sessionId,
+      chunkIndex,
+      partIndex,
+      partCount,
+      extension,
+      blob
+    });
+  });
+  await finished;
+}
+
+async function persistRecordingFinalization(sessionId, finalChunk, extension) {
+  const database = await openRecordingDatabase();
+  const transaction = database.transaction("sessions", "readwrite");
+  const finished = transactionFinished(transaction);
+  transaction.objectStore("sessions").put({ sessionId, finalChunk, extension });
+  await finished;
+}
+
+async function readPendingRecordingUploads() {
+  const database = await openRecordingDatabase();
+  const transaction = database.transaction(["parts", "sessions"], "readonly");
+  const finished = transactionFinished(transaction);
+  const partsRequest = transaction.objectStore("parts").getAll();
+  const sessionsRequest = transaction.objectStore("sessions").getAll();
+  const [parts, sessions] = await Promise.all([
+    new Promise((resolve, reject) => {
+      partsRequest.onsuccess = () => resolve(partsRequest.result);
+      partsRequest.onerror = () => reject(partsRequest.error);
+    }),
+    new Promise((resolve, reject) => {
+      sessionsRequest.onsuccess = () => resolve(sessionsRequest.result);
+      sessionsRequest.onerror = () => reject(sessionsRequest.error);
+    })
+  ]);
+  await finished;
+  return { parts, sessions };
+}
+
+async function removeUploadedRecordingPart(key) {
+  const database = await openRecordingDatabase();
+  const transaction = database.transaction("parts", "readwrite");
+  const finished = transactionFinished(transaction);
+  transaction.objectStore("parts").delete(key);
+  await finished;
+}
+
+async function removeFinishedRecording(sessionId) {
+  const database = await openRecordingDatabase();
+  const transaction = database.transaction(["parts", "sessions"], "readwrite");
+  const finished = transactionFinished(transaction);
+  const partsStore = transaction.objectStore("parts");
+  const keysRequest = partsStore.getAllKeys();
+  keysRequest.onsuccess = () => {
+    keysRequest.result
+      .filter((key) => key.startsWith(`${sessionId}:`))
+      .forEach((key) => partsStore.delete(key));
+  };
+  transaction.objectStore("sessions").delete(sessionId);
+  await finished;
+}
+
+async function requestRecordingUpload(url, options, description) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const controller = new AbortController();
+    const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
+    try {
+      logVoice("info", `${description} request.`, { url, attempt: attempt + 1 });
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      let result;
+      try {
+        result = await response.json();
+      } catch (error) {
+        throw new Error(`HTTP ${response.status} returned an invalid JSON response: ${error.message}`);
+      }
+      logVoice(response.ok ? "info" : "error", `${description} response.`, {
+        status: response.status,
+        body: result
+      });
+      if (!response.ok || !result.success) {
+        const error = new Error(result.error || `HTTP ${response.status}`);
+        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw error;
+      }
+      return { response, result };
+    } catch (error) {
+      lastError = error;
+      logVoice("warn", `${description} attempt failed.`, { attempt: attempt + 1, error });
+      if (error.retryable === false) break;
+      if (attempt < 4) {
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(250 * (2 ** attempt), 4000)));
+      }
+    } finally {
+      window.clearTimeout(requestTimeout);
+    }
+  }
+  throw lastError || new Error(`${description} failed.`);
+}
+
+function processRecordingUpload(sessionId) {
+  if (activeRecordingUploads.has(sessionId)) return activeRecordingUploads.get(sessionId);
+  const upload = (async () => {
+    const pending = await readPendingRecordingUploads();
+    const session = pending.sessions.find((item) => item.sessionId === sessionId);
+    if (!session) return;
+    const parts = pending.parts
+      .filter((item) => item.sessionId === sessionId)
+      .sort((left, right) => left.chunkIndex - right.chunkIndex || left.partIndex - right.partIndex);
+
+    for (const part of parts) {
+      const query = new URLSearchParams({
+        extension: part.extension,
+        parts: String(part.partCount)
+      });
+      const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${part.chunkIndex}/${part.partIndex}?${query}`;
+      const { result } = await requestRecordingUpload(url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: part.blob
+      }, "Audio chunk upload");
+      await removeUploadedRecordingPart(part.key);
+      if (result.complete === true && result.filename && Number(result.size) > 0) {
+        logVoice("info", "Backend confirmed a non-empty recording file.", {
+          sessionId, filename: result.filename, bytes: result.size
+        });
+        await removeFinishedRecording(sessionId);
+        return;
+      }
+    }
+
+    const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
+    const body = JSON.stringify({ final_chunk: session.finalChunk, extension: session.extension });
+    let result;
+    let completionConfirmed = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const completion = await requestRecordingUpload(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body
+      }, "Recording completion");
+      result = completion.result;
+      if (
+        result.complete === true
+        && result.filename
+        && Number.isInteger(Number(result.size))
+        && Number(result.size) > 0
+      ) {
+        completionConfirmed = true;
+        break;
+      }
+      if (completion.response.status !== 202) {
+        const error = new Error(`Backend did not confirm a non-empty recording file (HTTP ${completion.response.status}).`);
+        error.retryable = false;
+        throw error;
+      }
+      logVoice("warn", "Backend accepted completion but still reports missing audio parts.", {
+        sessionId, attempt: attempt + 1, body: result
+      });
+      if (attempt < 4) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      }
+    }
+    if (!completionConfirmed) {
+      const error = new Error("Backend did not confirm the completed recording after five checks.");
+      error.retryable = true;
+      throw error;
+    }
+    logVoice("info", "Backend confirmed a non-empty recording file.", {
+      sessionId, filename: result.filename, bytes: result.size
+    });
+    await removeFinishedRecording(sessionId);
+  })().catch((error) => {
+    logVoice("error", "Recording upload remains queued for a later retry.", { sessionId, error });
+    if (error.retryable !== false) {
+      window.setTimeout(() => {
+        void processRecordingUpload(sessionId);
+      }, 5000);
+    }
+  }).finally(() => {
+    activeRecordingUploads.delete(sessionId);
+  });
+  activeRecordingUploads.set(sessionId, upload);
+  return upload;
+}
+
+async function resumePendingRecordingUploads() {
+  if (!window.indexedDB) return;
+  try {
+    const pending = await readPendingRecordingUploads();
+    pending.sessions.forEach((session) => {
+      void processRecordingUpload(session.sessionId);
+    });
+  } catch (error) {
+    logVoice("error", "Could not resume locally queued recording uploads.", error);
+  }
+}
+
 async function beginGardenUnlock() {
   if (!flowerButton || flowerButton.disabled) return;
   const sessionGeneration = ++voiceSessionGeneration;
   logVoice("info", "Flower button clicked; creating voice session.", { sessionGeneration });
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Recognition || !window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) {
-    logVoice("error", "Voice unlock is unavailable. Use HTTPS and a browser with microphone and speech-recognition support.");
-    if (voiceStatus) voiceStatus.textContent = "Voice unlock is not available in this browser.";
+  if (window.isSecureContext === false) {
+    logVoice("error", "Voice unlock requires a secure HTTPS page.");
+    if (voiceStatus) voiceStatus.textContent = "Microphone access requires HTTPS. Open the secure site and try again.";
+    return;
+  }
+  if (!Recognition) {
+    logVoice("error", "This browser does not support Web Speech Recognition.");
+    if (voiceStatus) voiceStatus.textContent = "Voice recognition is not supported here. Try Chrome on Android or a supported desktop browser.";
+    return;
+  }
+  if (!window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) {
+    logVoice("error", "Voice recording is unavailable in this browser or secure context.");
+    if (voiceStatus) voiceStatus.textContent = "Microphone recording is unavailable. Use a current browser over HTTPS.";
     return;
   }
 
@@ -79,11 +325,12 @@ async function beginGardenUnlock() {
   let recordingStopped = false;
   let sessionFinished = false;
   let helloDetected = false;
-  let uploadCompleted = false;
-  let uploadStarted = false;
   let nextChunkIndex = 0;
-  const uploadQueue = [];
-  let uploadQueueRunning = false;
+  let capturedChunkCount = 0;
+  let capturedAudioBytes = 0;
+  const pendingChunkWrites = [];
+  let recordingStartedAt = 0;
+  let recordingFinalizationStarted = false;
   let navigationStarted = false;
   const sessionId = createRecordingSessionId();
   const mimeType = chooseRecorderType();
@@ -127,6 +374,7 @@ async function beginGardenUnlock() {
     window.clearTimeout(recognitionRestartTimer);
     window.clearTimeout(recognitionRecoveryTimer);
     stopRecognition();
+    setStatus("Hello heard — opening your surprise. The recording will upload in the background.");
     document.body.classList.add("garden-blooming");
     stopRecording();
   }
@@ -138,71 +386,16 @@ async function beginGardenUnlock() {
     window.location.assign("birthday.html");
   }
 
-  function beaconUploadPart(job) {
-    const query = new URLSearchParams({ extension, parts: String(job.partCount) });
-    const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${job.chunkIndex}/${job.partIndex}?${query}`;
-    const body = new Blob([job.blob], { type: "text/plain;charset=UTF-8" });
-    logVoice("info", "Audio chunk sendBeacon request.", {
-      sessionId, chunkIndex: job.chunkIndex, partIndex: job.partIndex, bytes: job.blob.size, url
-    });
-    const accepted = navigator.sendBeacon(url, body);
-    logVoice(accepted ? "info" : "error", "Unload-safe chunk upload queued.", {
-      sessionId,
-      chunkIndex: job.chunkIndex,
-      partIndex: job.partIndex,
-      bytes: job.blob.size,
-      accepted
-    });
-    if (!accepted) {
-      void fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=UTF-8" },
-        body,
-        keepalive: true
-      }).then((response) => {
-        logVoice(response.ok ? "info" : "error", "Keepalive chunk upload response.", {
-          sessionId, chunkIndex: job.chunkIndex, partIndex: job.partIndex, status: response.status
-        });
-      }).catch((error) => logVoice("error", "Keepalive chunk upload failed.", error));
-    }
-  }
-
-  function flushUploadsBeforeNavigation() {
-    const uniqueJobs = new Map();
-    uploadQueue.forEach((job) => uniqueJobs.set(`${job.chunkIndex}:${job.partIndex}`, job));
-    uniqueJobs.forEach(beaconUploadPart);
-    uploadQueue.length = 0;
-
-    if (nextChunkIndex > 0) {
-      const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
-      const body = new URLSearchParams({
-        final_chunk: String(nextChunkIndex - 1),
-        extension
-      });
-      const accepted = navigator.sendBeacon(url, body);
-      logVoice(accepted ? "info" : "error", "Unload-safe recording finalization queued.", {
-        sessionId, finalChunk: nextChunkIndex - 1, accepted
-      });
-      if (!accepted) {
-        void fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ final_chunk: nextChunkIndex - 1, extension }),
-          keepalive: true
-        }).then((response) => {
-          logVoice(response.ok ? "info" : "error", "Keepalive finalization response.", {
-            sessionId, status: response.status
-          });
-        }).catch((error) => logVoice("error", "Keepalive finalization failed.", error));
-      }
-    } else {
-      logVoice("error", "No audio chunks were captured; cannot finalize recording.", { sessionId });
-    }
-  }
-
   function startRecognition(isRestart = false) {
     if (!isCurrentSession() || sessionFinished || recognitionRunning) return;
-    const recognition = new Recognition();
+    let recognition;
+    try {
+      recognition = new Recognition();
+    } catch (error) {
+      logVoice("error", "Speech recognition could not be created.", error);
+      scheduleRecognitionRestart(1000);
+      return;
+    }
     currentRecognition = recognition;
     recognitionRunning = true;
     recognition.lang = "en-US";
@@ -239,12 +432,12 @@ async function beginGardenUnlock() {
       if (!isCurrentSession() || currentRecognition !== recognition || sessionFinished) return;
       const errorName = event.error || "unknown";
       if (["not-allowed", "service-not-allowed"].includes(errorName)) {
-        logVoice("error", "Speech recognition permission was denied. Allow microphone access for this site in Chrome.", errorName);
+        logVoice("error", "Speech recognition permission was denied. Allow microphone access for this site.", errorName);
         sessionFinished = true;
         window.clearTimeout(timeoutTimer);
         stopRecognition();
         stopRecording();
-        setStatus("Microphone permission is required. Allow access in Chrome and try again.");
+        setStatus("Microphone permission is required. Allow access in your browser settings and try again.");
         return;
       }
       if (["no-speech", "network", "aborted"].includes(errorName)) {
@@ -282,196 +475,105 @@ async function beginGardenUnlock() {
     }
   }
 
-  function logUploadCompleted(filename) {
-    if (uploadCompleted) return;
-    uploadCompleted = true;
-    logVoice("info", "Backend confirmed recording upload.", { sessionId, filename });
-  }
-
-  function enqueueUpload(job) {
-    uploadQueue.push(job);
-    void processUploadQueue();
-  }
-
-  async function uploadPart(blob, chunkIndex, partIndex, partCount) {
-    if (!uploadStarted) {
-      uploadStarted = true;
-      logVoice("info", "Audio upload started.", { sessionId });
-    }
-    const query = new URLSearchParams({
-      extension,
-      parts: String(partCount)
-    });
-    const url = `${API_BASE_URL}/api/recordings/${sessionId}/chunks/${chunkIndex}/${partIndex}?${query}`;
-    let lastError;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const controller = new AbortController();
-      const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
-      try {
-        logVoice("info", "Audio chunk upload request.", { sessionId, chunkIndex, partIndex, bytes: blob.size, attempt: attempt + 1 });
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "text/plain;charset=UTF-8" },
-          body: blob,
-          keepalive: true,
-          signal: controller.signal
-        });
-        const result = await response.json();
-        if (!response.ok || !result.success) {
-          const error = new Error(result.error || `HTTP ${response.status}`);
-          error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-          throw error;
-        }
-        logVoice("info", "Audio chunk upload response.", {
-          sessionId,
-          chunkIndex,
-          partIndex,
-          status: response.status,
-          complete: result.complete === true
-        });
-        if (result.complete) logUploadCompleted(result.filename);
-        return;
-      } catch (error) {
-        lastError = error;
-        logVoice("warn", "Audio chunk upload attempt failed.", {
-          sessionId,
-          chunkIndex,
-          partIndex,
-          attempt: attempt + 1,
-          error
-        });
-        if (error.retryable === false) break;
-        if (attempt < 4) {
-          await new Promise((resolve) => window.setTimeout(resolve, Math.min(250 * (2 ** attempt), 4000)));
-        }
-      } finally {
-        window.clearTimeout(requestTimeout);
-      }
-    }
-    logVoice("error", "Audio chunk upload failed after retries.", {
-      sessionId,
-      chunkIndex,
-      partIndex,
-      error: lastError
-    });
-    if (helloDetected) logVoice("error", "Background upload failed.", lastError);
-  }
-
-  async function processUploadQueue() {
-    if (uploadQueueRunning) return;
-    uploadQueueRunning = true;
-    try {
-      while (uploadQueue.length) {
-        const job = uploadQueue.shift();
-        await uploadPart(job.blob, job.chunkIndex, job.partIndex, job.partCount);
-      }
-    } finally {
-      uploadQueueRunning = false;
-      if (uploadQueue.length) void processUploadQueue();
-    }
-  }
-
   function queueRecordingChunk(blob) {
-    if (!blob.size) return;
-    logVoice("info", "Audio data captured.", { sessionId, bytes: blob.size, mimeType: blob.type });
+    if (!blob?.size) {
+      logVoice("warn", "MediaRecorder emitted an empty audio chunk.", { sessionId });
+      return;
+    }
+    capturedChunkCount += 1;
+    capturedAudioBytes += blob.size;
     const chunkIndex = nextChunkIndex;
     nextChunkIndex += 1;
     const partCount = Math.ceil(blob.size / MAX_UPLOAD_PART_BYTES);
+    const parts = [];
     for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
       const start = partIndex * MAX_UPLOAD_PART_BYTES;
-      const part = blob.slice(start, Math.min(start + MAX_UPLOAD_PART_BYTES, blob.size));
-      enqueueUpload({ blob: part, chunkIndex, partIndex, partCount });
+      parts.push(blob.slice(start, Math.min(start + MAX_UPLOAD_PART_BYTES, blob.size)));
     }
+    logVoice("info", "Audio chunk captured.", {
+      sessionId, chunkIndex, bytes: blob.size, partCount, mimeType: blob.type || mimeType || "browser default"
+    });
+    const write = persistRecordingParts(sessionId, chunkIndex, partCount, extension, parts);
+    pendingChunkWrites.push(write);
+    void write.catch((error) => logVoice("error", "Could not persist an audio chunk locally.", {
+      sessionId, chunkIndex, error
+    }));
   }
 
   async function finalizeRecording() {
     if (!nextChunkIndex) {
       logVoice("error", "No audio data was captured from the microphone.", { sessionId });
-      return;
+      return false;
     }
-    const url = `${API_BASE_URL}/api/recordings/${sessionId}/complete`;
-    const body = JSON.stringify({ final_chunk: nextChunkIndex - 1, extension });
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const controller = new AbortController();
-      const requestTimeout = window.setTimeout(() => controller.abort(), 15000);
-      try {
-        logVoice("info", "Recording finalization request.", { sessionId, finalChunk: nextChunkIndex - 1, attempt: attempt + 1 });
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-          keepalive: true,
-          signal: controller.signal
-        });
-        const result = await response.json();
-        if (!response.ok || !result.success) {
-          const error = new Error(result.error || `HTTP ${response.status}`);
-          error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-          throw error;
-        }
-        logVoice(response.ok ? "info" : "error", "Recording finalization response.", {
-          sessionId,
-          finalChunk: nextChunkIndex - 1,
-          status: response.status,
-          complete: result.complete === true
-        });
-        if (result.complete) logUploadCompleted(result.filename);
-        return;
-      } catch (error) {
-        logVoice("warn", "Recording finalization attempt failed.", {
-          sessionId,
-          attempt: attempt + 1,
-          error
-        });
-        if (error.retryable === false) break;
-        if (attempt < 4) {
-          await new Promise((resolve) => window.setTimeout(resolve, Math.min(250 * (2 ** attempt), 4000)));
-        }
-      } finally {
-        window.clearTimeout(requestTimeout);
-      }
-    }
-    logVoice("error", "Recording finalization failed after retries.", { sessionId });
+    await Promise.all(pendingChunkWrites);
+    await persistRecordingFinalization(sessionId, nextChunkIndex - 1, extension);
+    logVoice("info", "Recording stored locally and queued for upload.", {
+      sessionId,
+      durationMs: Math.round(performance.now() - recordingStartedAt),
+      chunkCount: capturedChunkCount,
+      mimeType: recorder?.mimeType || mimeType || "browser default",
+      totalAudioBytes: capturedAudioBytes,
+      finalChunk: nextChunkIndex - 1
+    });
+    void processRecordingUpload(sessionId);
+    return true;
   }
 
   function stopRecording() {
+    if (recordingStopped) return;
     if (!recorder || recorder.state === "inactive") {
+      recordingStopped = true;
       if (stream) stream.getTracks().forEach((track) => track.stop());
-      if (helloDetected) {
-        flushUploadsBeforeNavigation();
-        logVoice("info", "Voice session cleanup completed.", { sessionId });
-        navigateToBirthday();
-      }
-      else {
-        if (isCurrentSession()) {
-          flowerButton.disabled = false;
-          flowerButton.classList.remove("is-listening");
-        }
-        logVoice("info", "Voice session cleanup completed.", { sessionId });
-      }
+      void finishRecording();
       return;
     }
-    if (!recordingStopped) {
-      recordingStopped = true;
-      logVoice("info", "Stopping MediaRecorder.", { sessionId, state: recorder.state });
-    }
+    recordingStopped = true;
+    logVoice("info", "Stopping MediaRecorder.", { sessionId, state: recorder.state });
     try {
       recorder.stop();
     } catch (error) {
       logVoice("error", "Could not stop the voice recording.", error);
       if (stream) stream.getTracks().forEach((track) => track.stop());
-      if (helloDetected) {
-        flushUploadsBeforeNavigation();
-        logVoice("info", "Voice session cleanup completed after recorder stop failure.", { sessionId });
-        navigateToBirthday();
-      }
+      void finishRecording();
+    }
+  }
+
+  async function finishRecording() {
+    if (recordingFinalizationStarted) return;
+    recordingFinalizationStarted = true;
+    try {
+      await finalizeRecording();
+    } catch (error) {
+      logVoice("error", "Could not save the recording to local browser storage.", { sessionId, error });
+      setStatus("The recording could not be queued for upload. Check browser storage permissions.");
+    }
+    logVoice("info", "Voice recording stopped.", {
+      sessionId,
+      durationMs: recordingStartedAt ? Math.round(performance.now() - recordingStartedAt) : 0,
+      chunkCount: capturedChunkCount,
+      mimeType: recorder?.mimeType || mimeType || "browser default",
+      totalAudioBytes: capturedAudioBytes
+    });
+    if (helloDetected) {
+      logVoice("info", "Opening the surprise without waiting for the recording upload.", { sessionId });
+      navigateToBirthday();
+    } else if (isCurrentSession()) {
+      flowerButton.disabled = false;
+      flowerButton.classList.remove("is-listening");
+      logVoice("info", "Voice session cleanup completed.", { sessionId });
     }
   }
 
   try {
+    if (window.isSecureContext === false) {
+      throw new Error("Microphone access requires a secure HTTPS page.");
+    }
+    setStatus("Listening for “hello”…");
+    startRecognition();
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (!isCurrentSession()) {
+    if (!isCurrentSession() || sessionFinished) {
       stream.getTracks().forEach((track) => track.stop());
+      if (helloDetected) navigateToBirthday();
       return;
     }
     logVoice("info", "Microphone permission granted.", { sessionId });
@@ -479,7 +581,9 @@ async function beginGardenUnlock() {
     extension = recordingExtension(recorder.mimeType || mimeType || "audio/webm");
     logVoice("info", "MediaRecorder created.", { sessionId, mimeType: recorder.mimeType || "browser default" });
     recorder.addEventListener("start", () => {
-      logVoice("info", "MediaRecorder started.", { sessionId, state: recorder.state });
+      logVoice("info", "MediaRecorder started.", {
+        sessionId, state: recorder.state, mimeType: recorder.mimeType || "browser default"
+      });
     });
     ["pause", "resume"].forEach((eventName) => {
       recorder.addEventListener(eventName, () => {
@@ -488,8 +592,7 @@ async function beginGardenUnlock() {
     });
     recorder.addEventListener("dataavailable", (event) => {
       if (!isCurrentSession()) return;
-      if (event.data?.size) queueRecordingChunk(event.data);
-      else logVoice("warn", "MediaRecorder emitted an empty audio chunk.", { sessionId });
+      queueRecordingChunk(event.data);
     });
     recorder.addEventListener("stop", () => {
       logVoice("info", "MediaRecorder stopped; final dataavailable event has been handled.", { sessionId });
@@ -498,19 +601,7 @@ async function beginGardenUnlock() {
         logVoice("info", "Ignored stale voice-session stop callback.", { sessionId });
         return;
       }
-      if (helloDetected) {
-        flushUploadsBeforeNavigation();
-        logVoice("info", "Voice session cleanup completed.", { sessionId });
-        navigateToBirthday();
-      }
-      else {
-        void finalizeRecording();
-        if (isCurrentSession()) {
-          flowerButton.disabled = false;
-          flowerButton.classList.remove("is-listening");
-        }
-        logVoice("info", "Voice session cleanup completed.", { sessionId });
-      }
+      void finishRecording();
     });
 
     recorder.addEventListener("error", (event) => {
@@ -527,7 +618,9 @@ async function beginGardenUnlock() {
     if (recorder.state !== "recording") {
       throw new Error(`MediaRecorder did not enter recording state (state: ${recorder.state}).`);
     }
+    recordingStartedAt = performance.now();
     logVoice("info", "MediaRecorder is recording.", { sessionId });
+    setStatus("Microphone ready — say “hello” to continue.");
     timeoutTimer = window.setTimeout(() => {
       if (!isCurrentSession() || sessionFinished) return;
       logVoice("warn", "Voice recognition timeout reached.", { sessionId });
@@ -538,9 +631,10 @@ async function beginGardenUnlock() {
       stopRecording();
     }, RECORDING_LIMIT_MS);
 
-    startRecognition();
   } catch (error) {
-    logVoice("error", "Voice unlock could not start. Check microphone permission and browser support.", error);
+    logVoice("error", "Voice unlock could not start. Check HTTPS, microphone permission, and browser support.", error);
+    sessionFinished = true;
+    window.clearTimeout(timeoutTimer);
     if (currentRecognition) stopRecognition();
     if (recorder && recorder.state !== "inactive") {
       try {
@@ -554,15 +648,24 @@ async function beginGardenUnlock() {
       flowerButton.disabled = false;
       flowerButton.classList.remove("is-listening");
     }
-    setStatus(error.name === "NotAllowedError" || error.name === "SecurityError"
-      ? "Microphone permission was denied. Allow access in Chrome and try again."
-      : "Microphone access is required. Please try again.");
+    if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+      setStatus("Microphone permission was denied. Allow it in your browser settings and try again.");
+    } else if (error.name === "NotFoundError") {
+      setStatus("No microphone was found on this device.");
+    } else if (error.name === "NotReadableError") {
+      setStatus("The microphone is busy in another app. Close it and try again.");
+    } else if (error.message.includes("secure HTTPS")) {
+      setStatus(error.message);
+    } else {
+      setStatus("Could not start voice input. Check microphone permission and try again.");
+    }
     return;
   }
 
 }
 
 if (flowerButton) flowerButton.addEventListener("click", beginGardenUnlock);
+void resumePendingRecordingUploads();
 
 const sceneElements = [...document.querySelectorAll("[data-scene]")];
 function showJourneyScene(name) {
